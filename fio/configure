@@ -1,0 +1,15 @@
+#!/bin/bash
+#Interim configure script that applies the patch,
+# runs the real configure script,
+
+fullpath=$(realpath $0)
+dirpath=$(dirname $fullpath)
+pushd $dirpath
+git submodule update --init --recursive
+pushd official-fio
+patch -N -p1 < ../SEF-FIO.patch
+popd #official-fio
+popd #dirpath
+
+$dirpath/official-fio/configure "$@"
+

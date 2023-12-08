@@ -1,0 +1,207 @@
+.\" Manpage for SEF CLI
+.TH SEF-CLI 1 "2023-5-1" "SEF Cli" "User Commands"
+.TH NAME
+sef-cli \- control, modify, and manipulate SEF Units using CLI
+.TH SYNOPSIS
+\&\fIsef-cli \fR\fB<target-specific-action> <target>\fR [target-specific-parameters]
+.TH DESCRIPTION
+sef-cli is a versatile command line tool provided as a means of performing SEF device configuration, administration, and debugging. sef-cli supports many different engines, and each engine supports multiple actions.
+.br
+.TH TARGETS
+    \fBvirtual-device      \fR Perform actions toward Virtual Devices
+    \fBshell               \fR A Python Shell extended with SEF functionality for interaction with the device
+    \fBsef-unit            \fR Perform actions toward mounted sef units
+    \fBqos-domain          \fR Perform actions toward QoS Domains
+    \fBftl                 \fR Perform actions toward SEF Reference FTL
+.TH ACTIONS
+    \fIvirtual-device\fR:
+        \fBlist                \fR Print list of created Virtual Devices. Commands to recreate same configuration is printed in verbose
+        \fBdraw                \fR Print a map of created Virtual Devices
+        \fBinfo                \fR Print a Virtual Device's information; Prints usage data in verbose mode
+        \fBcreate              \fR Create a new Virtual Device
+        \fBdelete              \fR Delete Virtual Device. Virtual Device can only be deleted if it is empty
+        \fBset-pslc            \fR Sets the number of pSLC super blocks for a virtual device
+        \fBset-suspend-config  \fR Sets the suspend configuration for a Virtual Device
+        \fBhelp                \fR Print verbose help for the target
+    \fIshell\fR:
+        \fBinteractive         \fR An Interactive shell to interact with the device in realtime
+        \fBexecute             \fR Execute a Python script to interact with the device
+        \fBhelp                \fR Print verbose help for the target
+    \fIsef-unit\fR:
+        \fBlist                \fR Print list of available SEF Units. Additional info is printed in verbose mode
+        \fBinfo                \fR Prints SEF Unit's information
+        \fBhelp                \fR Print verbose help for the target
+    \fIqos-domain\fR:
+        \fBlist                \fR Print list of available QoS Domains. Commands to recreate same configuration is printed in verbose
+        \fBinfo                \fR Prints QoS Domain's information
+        \fBcreate              \fR create a new QoS Domain
+        \fBdelete              \fR Delete QoS Domain. All data stored in QoS Domain will be removed
+        \fBformat              \fR Format QoS Domain. All data stored in QoS Domain will be removed, but the QoS Domain will not be removed
+        \fBbackup              \fR Backup QoS Domain's stored data to a set of files
+        \fBrestore             \fR Restore a set of backed up files to the QoS Domain
+        \fBresize              \fR Change size of existing QoS Domain
+        \fBlabel               \fR Set the label for an existing QoS Domain
+        \fBhelp                \fR Print verbose help for the target
+    \fIftl\fR:
+        \fBinfo                \fR Prints the SEF Block Module's information/configuration
+        \fBconfigure           \fR Configure the SEF Block Module
+        \fBcheck               \fR Check the SEF Block Module's health, and repair if broken
+        \fBhelp                \fR Print verbose help for the target
+.TH TYPES
+    \fBFlag           \fR a specific argument which enables a corresponding option
+.br
+    \fBInt            \fR a whole number that's positive, negative, or zero
+.br
+                       \fB8-bit     \fR\fIRange:\fR -128 - 127
+                       \fB16-bit    \fR\fIRange:\fR -32768 - 32767
+                       \fB32-bit    \fR\fIRange:\fR -2147483648 - 2147483647
+                       \fB64-bit    \fR\fIRange:\fR -9223372036854775808 - 9223372036854775807
+    \fBUnsigned Int   \fR a non-negative integer value
+.br
+                       \fB8-bit     \fR\fIRange:\fR 0 - 255
+                       \fB16-bit    \fR\fIRange:\fR 0 - 65535
+                       \fB32-bit    \fR\fIRange:\fR 0 - 4294967295
+                       \fB64-bit    \fR\fIRange:\fR 0 - 18446744073709551615
+    \fBChar           \fR a single character argument
+.br
+    \fBEnum           \fR an enumerator; should be one of a set of possible values
+.br
+    \fBString         \fR a collection of characters
+.br
+    \fBTuple          \fR an argument consisting of a colon-separated group of same type, as in 'a:c' or '0:4'
+.br
+    \fBArray          \fR a space-separated list of integers, unsigned integers, characters, enumerators, strings, or tuples, as in '1 1 3' or 'a:b d:e'
+.br
+
+.TH OPTIONS
+\fIGeneral Options\fR
+.br
+    \fB-h\fR, \fB--help                \fR Prints help and exits
+.br
+                               optional             Flag   
+.sp
+    \fB-V\fR, \fB--verbose             \fR Explains what is being done or shows additional information regarding the action being taken
+.br
+                               optional             Flag   
+.sp
+    \fB- \fR, \fB--version             \fR Prints version number and git commit hash and exits
+.br
+                               optional             Flag   
+.sp
+    \fB-w\fR, \fB--column-width        \fR Sets output width (number of characters printed per line)
+.br
+                               optional             Int     Default: 80             
+.sp
+    \fB- \fR, \fB--man-page            \fR Prints man page for sef-cli and exits
+.br
+                               optional             Flag   
+.sp
+
+\fITarget-specific Options:\fR
+    \fBvirtual-device      \fR Perform actions toward Virtual Devices
+        \fB-s --sef-index            \fR The index of the target SEF Unit
+                                   Unsigned Int(16-bits)     
+        \fB-v --virtual-device-id    \fR The ID for the target Virtual Device
+                                   Unsigned Int(16-bits)     
+        \fB-- --num-pslc-super-block \fR The number of pSLC super blocks to set
+                                   Unsigned Int(32-bits)     
+        \fB-- --suspend-max-time-per \fR Read will issued within this time.  When 0, the number of read command is unlimited. When larger than the device defined maximum value, the device defined value is used.
+                                   Unsigned Int(32-bits)     
+        \fB-- --suspend-min-time-unt \fR A suspend starts when the cumulated weights of pending reads exceeds this value.  When 0, the suspend will start immediately for a pending read.
+                                   Unsigned Int(32-bits)     
+        \fB-- --suspend-max-interval \fR Suspend starts for a pending read command after this interval since the last resume (or start programming/erase).  When larger than the device defined minimum value, the device defined value is used.
+                                   Unsigned Int(32-bits)     
+        \fB-- --channel-num          \fR A list of channels to be used to describe Virtual Device(s)
+                                   Unsigned Int(16-bits)     [Array] 
+        \fB-- --bank-num             \fR A list of banks to be used to describe Virtual Device(s)
+                                   Unsigned Int(16-bits)     [Array] 
+        \fB-- --repeat-num           \fR A list of numbers of times each configuration should be repeated
+                                   Unsigned Int(16-bits)     [Array] 
+        \fB-- --die-map              \fR A list of IDs locating Virtual Devices in a SEF Unit ordered by die
+                                   Unsigned Int(16-bits)     [Array] 
+        \fB-- --super-block          \fR A list of tuples denoting the Virtual Device ID and number of dies per Super Block
+                                   Unsigned Int(64-bits)     [Array] [Tuple] 
+        \fB-- --read-weight          \fR A list of tuples of Default weights for read operations for each possible read queue
+                                   Unsigned Int(64-bits)     [Array] [Tuple] 
+        \fB-- --tiling-strategy      \fR The strategy to be used to populate the remaining empty space in a SEF Unit
+                                   :Enum                      Default: kStrict        Possible Values: kStrict,kFill
+        \fB-V --verbose              \fR Show additional information regarding the action being taken
+                                   :Flag                      
+        \fB-f --force                \fR Never prompt before removing or creating Virtual Device
+                                   :Flag                      
+    \fBshell               \fR A Python Shell extended with SEF functionality for interaction with the device
+        \fB-- --python-script        \fR The Python Script to be executed by the SEF CLI Shell
+                                   :String                    
+        \fB-- --script-pipe          \fR 
+                                   :Flag                      
+    \fBsef-unit            \fR Perform actions toward mounted sef units
+        \fB-s --sef-index            \fR The index of the target SEF Unit
+                                   Unsigned Int(16-bits)     
+        \fB-V --verbose              \fR show additional information regarding the action being taken
+                                   :Flag                      
+    \fBqos-domain          \fR Perform actions toward QoS Domains
+        \fB-s --sef-index            \fR The index of the target SEF Unit
+                                   Unsigned Int(16-bits)     
+        \fB-q --qos-domain-id        \fR The ID for the target QoS Domain
+                                   Unsigned Int(16-bits)     
+        \fB-l --label                \fR The label for the target QoS Domain
+                                   Unsigned Int(64-bits)     [Array] 
+        \fB-v --virtual-device-id    \fR The ID for the target Virtual Device
+                                   Unsigned Int(64-bits)     
+        \fB-- --flash-capacity       \fR Number of required/reserved ADUs
+                                   Unsigned Int(64-bits)     
+        \fB-- --flash-capacity-perce \fR Percentage of the Virtual Device that should be used for the QoS Domain capacity
+                                   Unsigned Int(8 -bits)     Default: 100            
+        \fB-- --pslc-flash-capacity  \fR Number of required/reserved pSLC adus
+                                   Unsigned Int(64-bits)     Default: 0              
+        \fB-- --flash-quota          \fR Number of ADUs that can be allocated; When the flashQuota is less than the flashCapacity, it will be set to the flashCapacity; the same option is used to set the PSLC
+                                   Unsigned Int(64-bits)     Default: 1              
+        \fB-- --adu-size             \fR Size of Atomic Data Unit (ADU) in data and metadata in bytes. Must be one of the values supported by this SEF unit.
+                                   Unsigned Int(64-bits)     [Tuple] Default: 4096:16        
+        \fB-- --api                  \fR Specifies the API Identifier for this QoS domain
+                                   :Enum                      Default: kSuperBlock    Possible Values: kSuperBlock,kInDriveGC,kVirtualSSD
+        \fB-- --recovery             \fR Specifies the recovery mode for this QoS domain
+                                   :Enum                      Default: kAutomatic     Possible Values: kAutomatic,kHostControlled
+        \fB-- --defect-strategy      \fR Defect management strategy for the QoS Domain
+                                   :Enum                      Default: kPerfect       Possible Values: kPacked,kFragmented,kPerfect
+        \fB-- --encryption-key       \fR Specifies the QoS Domain encryption key
+                                   :String                    
+        \fB-- --num-placement-id     \fR The maximum number of Placement IDs that can be placed on the QoS domain.
+                                   Unsigned Int(16-bits)     Default: 1              
+        \fB-- --max-open-super-block \fR The maximum number super blocks that can be open in a QoS domain.
+                                   Unsigned Int(16-bits)     Default: 0              
+        \fB-- --read-queue           \fR Default scheduling queue for user read commands
+                                   Unsigned Int(8 -bits)     Default: 0              
+        \fB-- --program-weight       \fR Default scheduling queue for user read commands
+                                   Unsigned Int(16-bits)     
+        \fB-- --erase-weight         \fR Default scheduling queue for user nameless write commands
+                                   Unsigned Int(16-bits)     
+        \fB-V --verbose              \fR show additional information regarding the action being taken
+                                   :Flag                      
+        \fB-- --path                 \fR Path to be used for backup or restore of the QoS Domain
+                                   :String                    
+        \fB-- --prefix               \fR 
+                                   :String                    Default: backup         
+        \fB-- --allow-list           \fR A list of user addresses to keep, all other user addresses will be ignored
+                                   Unsigned Int(64-bits)     [Array] [Tuple] 
+        \fB-- --block-list           \fR A list of user addresses to ignore, all other user addresses will be kept
+                                   Unsigned Int(64-bits)     [Array] [Tuple] 
+        \fB-- --relabel              \fR Will retain the current label of the domain
+                                   :Flag                      
+        \fB-f --force                \fR Never prompt before removing or creating QoS Domains
+                                   :Flag                      
+    \fBftl                 \fR Perform actions toward SEF Reference FTL
+        \fB-s --sef-index            \fR The index of the target SEF Unit
+                                   Unsigned Int(16-bits)     
+        \fB-q --qos-domain-id        \fR The ID for the target QoS Domain
+                                   Unsigned Int(16-bits)     
+        \fB-l --label                \fR The label for the target QoS Domain
+                                   Unsigned Int(64-bits)     [Array] 
+        \fB-- --num-domains          \fR Number of domains for device
+                                   Unsigned Int(16-bits)     Default: 1              
+        \fB-- --overprovisioning     \fR Percent of overprovisioning (e.g., 20 for 20%%)
+                                   Unsigned Int(8 -bits)     Default: 0              
+        \fB-- --should-repair        \fR Should the Block Module be repaired if problems are found. Might result in losing placement data
+                                   :Flag                      
+        \fB-f --force                \fR Never prompt before formating or configuring SDK
+                                   :Flag                      

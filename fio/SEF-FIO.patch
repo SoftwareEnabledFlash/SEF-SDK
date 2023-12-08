@@ -1,0 +1,1248 @@
+diff --git a/Makefile b/Makefile
+index 6d7fd4e2..f9dbb425 100644
+--- a/Makefile
++++ b/Makefile
+@@ -172,6 +172,9 @@ ifdef CONFIG_DFS
+   dfs_LIBS = -luuid -ldaos -ldfs
+   ENGINES += dfs
+ endif
++ifdef CONFIG_SEF
++  SOURCE += engines/sef.c
++endif
+ SOURCE += oslib/asprintf.c
+ ifndef CONFIG_STRSEP
+   SOURCE += oslib/strsep.c
+diff --git a/configure b/configure
+index 45d10a31..97e2767e 100755
+--- a/configure
++++ b/configure
+@@ -173,6 +173,7 @@ disable_native="no"
+ march_set="no"
+ libiscsi="no"
+ libnbd="no"
++sef_Lib_type="emulator"
+ libnfs=""
+ xnvme=""
+ libblkio=""
+@@ -218,6 +219,10 @@ for opt do
+   ;;
+   --disable-http) disable_http="yes"
+   ;;
++  --disable-sef) disable_sef="yes"
++  ;;
++  --sef-lib-type=*) sef_Lib_type="$optarg"
++  ;;
+   --disable-gfapi) disable_gfapi="yes"
+   ;;
+   --enable-libhdfs) libhdfs="yes"
+@@ -290,6 +295,8 @@ if test "$show_help" = "yes" ; then
+   echo "--disable-rados         Disable Rados support even if found"
+   echo "--disable-rbd           Disable Rados Block Device even if found"
+   echo "--disable-http          Disable HTTP support even if found"
++  echo "--disable-sef           Disable SEF support even if found"
++  echo "--sef-lib-type          Set the library that should be used for sef (valid values: simulator, emulator[default])"
+   echo "--disable-gfapi         Disable gfapi"
+   echo "--enable-libhdfs        Enable hdfs support"
+   echo "--enable-libnfs         Enable nfs support"
+@@ -442,8 +449,6 @@ CYGWIN*)
+   clock_gettime="yes" # clock_monotonic probe has dependency on this
+   clock_monotonic="yes"
+   sched_idle="yes"
+-  pthread_condattr_setclock="no"
+-  pthread_affinity="no"
+   ;;
+ esac
+ 
+@@ -1880,6 +1885,37 @@ if test "$disable_http" != "yes"; then
+ fi
+ print_config "http engine" "$http"
+ 
++##########################################
++# check for SEF
++if test "$sef" != "yes" ; then
++  sef="no"
++fi
++cat > $TMPC << EOF
++#include <SEFAPI.h>
++#include <sef-block-module.h>
++
++int main(int argc, char **argv)
++{
++  SEFLibraryInit();
++  SEFBlockGetInfo(0,0);
++  return 0;
++}
++EOF
++if test "$disable_sef" != "yes"; then
++  if test "$sef_Lib_type" = "sim" || test "$sef_Lib_type" = "simulator"; then
++    SEF_LIBS="-lsef-sim -lsef-ftl -lstdc++ -lyaml-cpp"
++  else
++    SEF_LIBS="-lsef -lsef-ftl"
++  fi
++  if compile_prog "" "$SEF_LIBS" "sef-ftl"; then
++    LIBS="$SEF_LIBS $LIBS"
++    sef="yes"
++  else
++    sef="no"
++  fi
++fi
++print_config "SEF engine" "$sef"
++
+ ##########################################
+ # check for rados
+ if test "$rados" != "yes" ; then
+@@ -3119,6 +3155,12 @@ fi
+ if test "$http" = "yes" ; then
+   output_sym "CONFIG_HTTP"
+ fi
++if test "$sef" = "yes" ; then
++  output_sym "CONFIG_SEF"
++fi
++if test "$sef_Lib_type" = "simulator" ; then
++  output_sym "SIMULATOR"
++fi
+ if test "$rados" = "yes" ; then
+   output_sym "CONFIG_RADOS"
+ fi
+diff --git a/engines/sef.c b/engines/sef.c
+new file mode 100644
+index 00000000..5a11cc98
+--- /dev/null
++++ b/engines/sef.c
+@@ -0,0 +1,1085 @@
++/*
++ * SOFTWARE-ENABLED FLASH (“SEF”)
++ * Software Development Kit (SDK)
++ * sef.c
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * This software is licensed under the 3-Clause BSD License.
++ *
++ * Copyright (C) 2018-2023 - KIOXIA Corporation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++#include <assert.h>
++#include <errno.h>
++#include <inttypes.h>
++#include <sys/queue.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++#include <SEFAPI.h>
++#include <sef-utils.h>
++#include <buddy.h>
++
++#ifdef SIMULATOR
++#include <SEFSim.h>
++#endif /* SIMULATOR */
++#include <sef-block-module.h>
++
++#include "../optgroup.h"
++#include "../fio.h"
++
++#define VWB_SIZE (96*1024)
++#define SEF_IO_U_IN_FLIGHT 0
++#define SEF_IO_U_COMPLETE 1
++#define SEF_IO_U_NEEDS_BUF 2
++
++#define CC_MAX_WRITE_IO     768
++#define CC_MIN_WRITE_ADUS   160
++
++atomic_uint sef_req_io; /* How many i/os are required to make progress */
++
++static size_t NEXT_POWER_2(size_t s) {
++    s--;
++    s |= s >> 1;
++    s |= s >> 2;
++    s |= s >> 4;
++    s |= s >> 8;
++    s |= s >> 16;
++    s |= s >> 32;
++    return ++s;
++}
++
++static uint32_t GET_ORDER(size_t s) {
++    uint32_t order = 0;
++    while(s) {
++        s >>= 1;
++        order++;
++    }
++    return order;
++}
++
++static pthread_mutex_t libMutex = PTHREAD_MUTEX_INITIALIZER;
++
++struct sef_block_data
++{
++    LIST_ENTRY(sef_block_data)
++    link;
++    pthread_mutex_t lock;
++    int refCnt;
++    int openCnt;
++    int sefUnitIndex;
++    struct SEFQoSDomainID qosDomainId;
++    uint64_t capacity;
++    SEFBlockHandle context;
++    int aduSize;
++    int numPlacementId;
++    int numDomains;
++#if CC_MAX_WRITE_IO
++    uint16_t *plids;    // plid[] refcnts (each non-zero is an open sb)
++    int ndpsb;          // num dies per super block
++#endif
++};
++
++LIST_HEAD(sef_block_data_head, sef_block_data)
++blockData = LIST_HEAD_INITIALIZER(blockData);
++
++struct sef_options
++{
++    void *pad;
++    unsigned int sefUnitIndex;
++    unsigned int qosDomainIdInt;
++    unsigned long long qosDomainLabel[2];
++    bool zeroCopy;
++    bool busyPoll;
++    int readQueue;
++    int readWeight;
++    int writeWeight;
++    int placementId;
++    char *instrumentationPath;
++#ifdef SIMULATOR
++    char *sefSimConfig;
++#endif /* SIMULATOR */
++#if CC_MAX_WRITE_IO
++    bool stop_on_dl_warn;
++#endif
++};
++
++static struct fio_option options[] =
++    {
++        {
++            .name = "sef_unit_index",
++            .lname = "SEF Unit Index",
++            .type = FIO_OPT_INT,
++            .off1 = offsetof(struct sef_options, sefUnitIndex),
++            .help = "The index of the SEF Unit, the index is zero based",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "qos_domain_id",
++            .lname = "QoS Domain Id",
++            .type = FIO_OPT_INT,
++		    .def	= "0",
++            .off1 = offsetof(struct sef_options, qosDomainIdInt),
++            .help = "QoS Domain Id",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "qos_domain_label",
++            .lname = "QoS Domain Label",
++            .type = FIO_OPT_ULL,
++		    .def	= "0,0",
++            .off1 = offsetof(struct sef_options, qosDomainLabel[0]),
++            .off2 = offsetof(struct sef_options, qosDomainLabel[1]),
++            .help = "The label associated with the QoS Domain",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "sef_zero_copy",
++            .lname = "User zero copy buffers",
++            .type     = FIO_OPT_BOOL,
++            .def	  = "0",
++            .off1 = offsetof(struct sef_options, zeroCopy),
++            .help = "Use zero copy buffers",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "read_queue",
++            .lname = "kSEFRead queue override",
++    		.type	= FIO_OPT_INT,
++            .def = "255",
++            .off1 = offsetof(struct sef_options, readQueue),
++            .help = "kSEFRead queue override when valid",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "read_weight",
++            .lname = "Read weight override",
++    		.type	= FIO_OPT_INT,
++            .def = "0",
++            .off1 = offsetof(struct sef_options, readWeight),
++            .help = "Read weight to override when non-zero",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "write_weight",
++            .lname = "Write weight override",
++    		.type	= FIO_OPT_INT,
++            .def = "0",
++            .off1 = offsetof(struct sef_options, writeWeight),
++            .help = "Write weight to override when non-zero",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++        {
++            .name = "placement_id",
++            .lname = "Placement ID for writes",
++            .type = FIO_OPT_INT,
++            .def = "0",
++            .off1 = offsetof(struct sef_options, placementId),
++            .help = "Placement ID for writes",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF,
++        },
++        {
++            .name = "instrumentation_path",
++            .lname = "the path to be used for instrumentation",
++            .type = FIO_OPT_STR_STORE,
++            .off1 = offsetof(struct sef_options, instrumentationPath),
++            .help = "The location for the Unix Domain Socket. Will replace the first two format specifier with UnitIndex and QoSDomainId. Defaults to /tmp/SEFFTLDomain.[UnitIndex].[QoSDomainId]",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF,
++        },
++        {
++            .name     = "busy_poll",
++            .lname    = "busy poll mode",
++            .type     = FIO_OPT_BOOL,
++            .def	  = "1",
++            .help     = "Busy poll for completions instead of sleeping",
++            .off1     = offsetof(struct sef_options, busyPoll),
++            .category = FIO_OPT_C_ENGINE,
++            .group    = FIO_OPT_G_SEF,
++        },
++#ifdef SIMULATOR
++        {
++            .name = "sef_sim_config",
++            .lname = "SEF Simulator Config File",
++            .type = FIO_OPT_STR_STORE,
++            .off1 = offsetof(struct sef_options, sefSimConfig),
++            .help = "The location of the SEF Simulator's config file",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF,
++        },
++#endif /* SIMULATOR */
++#if CC_MAX_WRITE_IO
++        {
++            .name = "stop_on_dl_warn",
++            .lname = "stop on dead lock warning",
++            .type	= FIO_OPT_STR_SET,
++            .off1 = offsetof(struct sef_options, stop_on_dl_warn),
++            .help = "Stop on dead lock warning",
++            .category = FIO_OPT_C_ENGINE,
++            .group = FIO_OPT_G_SEF
++        },
++#endif
++        {
++            .name = NULL,
++        },
++};
++
++struct io_data
++{
++    struct sef_data *sefData;
++    struct io_u *ioUnit;
++    struct io_data *link;
++    int complete;
++    int cnt;
++};
++
++struct sef_data
++{
++    int inFlightCount;
++    struct io_data *inFlight;
++
++    int completedFlightCount;
++    struct io_data *completedFlight;
++
++    struct io_u **completedIoU;
++
++    void *context;
++    int sefUnitIndex;
++    struct SEFQoSDomainID qosDomainId;
++    int aduSize;
++
++    int numDomains;
++    struct sef_block_data *sbd;
++    bool zeroCopy;
++    BuddyAllocator buddy_alloc;
++
++    pthread_mutex_t inFlightLock;
++    pthread_cond_t completedFlightIO;
++};
++
++static struct io_u *fio_sef_event(struct thread_data *td, int event)
++{
++    struct sef_data *sd;
++
++    sd = td->io_ops_data;
++    return sd->completedIoU[event];
++}
++
++static void sef_remove_inflight(struct io_data *ioData, struct sef_data *sd)
++{
++    struct io_data **ioDataPtr;
++
++    ioDataPtr = &sd->inFlight;
++
++    while (*ioDataPtr)
++    {
++        if (*ioDataPtr == ioData)
++        {
++            // remove from in flight list
++            sd->inFlightCount--;
++            *ioDataPtr = ioData->link;
++        }
++        else
++        {
++            // move the pointer
++            ioDataPtr = &((*ioDataPtr)->link);
++        }
++    }
++}
++
++static int fio_sef_getevents(struct thread_data *td, unsigned int min_events, unsigned int max, const struct timespec *t)
++{
++    int ret = 0;
++    struct sef_data *sd;
++    struct sef_options *options;
++    struct io_data **ioData;
++
++    // assign local variables
++    sd = td->io_ops_data;
++    options = td->eo;
++
++    if (options->busyPoll)
++    {
++        struct timespec ts = {0, 100000};
++
++        while (ret < min_events)
++        {
++            pthread_mutex_lock(&sd->inFlightLock);
++
++            ret = sd->completedFlightCount;
++
++            pthread_mutex_unlock(&sd->inFlightLock);
++
++            // sleep if no io_u is completed
++            if (ret < min_events)
++                nanosleep(&ts, NULL);
++        }
++    }
++    else
++    {
++        pthread_mutex_lock(&sd->inFlightLock);
++
++        while (sd->completedFlightCount < min_events)
++            pthread_cond_wait(&sd->completedFlightIO, &sd->inFlightLock);
++
++        pthread_mutex_unlock(&sd->inFlightLock);
++    }
++
++
++    pthread_mutex_lock(&sd->inFlightLock);
++
++    ret = 0;
++    ioData = &sd->completedFlight;
++    while (*ioData)
++    {
++        struct io_data *done = *ioData;
++        done->sefData->completedIoU[ret++] = done->ioUnit;
++        done->sefData->completedFlightCount--;
++        *ioData = done->link;
++        free(done);
++    }
++
++    pthread_mutex_unlock(&sd->inFlightLock);
++
++    return ret;
++}
++
++static struct SEFStatus fio_sef_get_qos_domain_id(struct sef_options *options)
++{
++    struct SEFStatus status = {0};
++    SEFHandle sefHandle;
++    struct SIFLabel label;
++    struct SEFQoSDomainList *list;
++
++    if (options->qosDomainIdInt != 0)
++        return SUMakeStatusOk();
++
++    // input error checking
++    if (options->qosDomainLabel[0] == 0 && options->qosDomainLabel[1] == 0)
++    {
++        log_err("sef: The QoS Domain ID or Label is required\n");
++        return SUMakeStatusError(EADDRNOTAVAIL);
++    }
++
++    // get sef unit handle
++    sefHandle = SEFGetHandle(options->sefUnitIndex);
++
++    // populate the object
++    list = malloc(sizeof(struct SEFQoSDomainList) + sizeof(struct SEFQoSDomainID));
++    label.data[0] = options->qosDomainLabel[0];
++    label.data[1] = options->qosDomainLabel[1];
++
++    // get id from label
++    status = SUGetQosDomainId(sefHandle, label, list, sizeof(struct SEFQoSDomainList) + sizeof(struct SEFQoSDomainID));
++    if (status.error || list->numQoSDomains == 0)
++    {
++        log_err("sef: The QoS Domain Label is not valid\n");
++        return status;
++    }
++
++    if (list->numQoSDomains > 1)
++    {
++        log_err("sef: The QoS Domain Label is not unique\n");
++        return SUMakeStatusError(EADDRNOTAVAIL);
++    }
++
++    options->qosDomainIdInt = list->QoSDomainID[0].id;
++
++    // free memory
++    free(list);
++
++    return SUMakeStatusOk();
++}
++
++// todo: because this is defined, we need to be calling io_u_queued for
++// accurate submit latency.
++static int fio_sef_commit(struct thread_data *td)
++{ // called to flush entries if i/o return busy
++    return 0;
++}
++
++static void fio_sef_completed(struct SEFMultiContext *context)
++{
++    struct io_data *ioData;
++    struct sef_data *sd;
++    void * new_buf;
++    uint32_t num_pages;
++
++    // assign local variables
++    ioData = (struct io_data *)context->arg;
++    sd = ioData->sefData;
++    num_pages = ioData->ioUnit->xfer_buflen / sd->aduSize;
++    
++    // check for errors
++    if (!context->error)
++    {
++        ioData->ioUnit->error = 0;
++        ioData->ioUnit->resid = 0;
++    }
++    else
++    {
++        log_err("sef: Request failed with error %d\n", context->error);
++        ioData->ioUnit->error = -context->error;
++        ioData->ioUnit->resid = ioData->ioUnit->xfer_buflen;
++    }
++
++    // mark the io_u as completed
++    if (ioData->ioUnit->ddir == DDIR_WRITE && sd->zeroCopy) {
++        if ((new_buf = buddy_alloc_pages(&sd->buddy_alloc, num_pages))) {
++            ioData->ioUnit->buf = new_buf;
++            ioData->complete = SEF_IO_U_COMPLETE;
++        }
++        else {
++            ioData->ioUnit->buf = NULL;
++            ioData->complete = SEF_IO_U_NEEDS_BUF;
++        }
++    }
++    else
++        ioData->complete = SEF_IO_U_COMPLETE;
++
++    // move data to completed from in flight list
++    if (ioData->complete == SEF_IO_U_COMPLETE)
++    {
++
++        pthread_mutex_lock(&sd->inFlightLock);
++
++        sef_remove_inflight(ioData, sd);
++
++        // add to done list
++        ioData->link = sd->completedFlight;
++        sd->completedFlight = ioData;
++        sd->completedFlightCount++;
++
++        // signal change new completed io
++        pthread_cond_signal(&sd->completedFlightIO);
++
++        pthread_mutex_unlock(&sd->inFlightLock);
++    }
++
++    if (context->iov)
++        free(context->iov);
++
++    if (context)
++        free(context);
++}
++
++static enum fio_q_status fio_sef_queue(struct thread_data *td, struct io_u *io_u)
++{
++    struct SEFMultiContext *multiContext;
++    struct SEFStatus status;
++    struct sef_data *sd;
++    struct sef_options *options;
++    struct io_data *ioData;
++    struct iovec *iov;
++
++    // assign local variables
++    options = td->eo;
++    sd = td->io_ops_data;
++
++    // check for input sanity
++    fio_ro_check(td, io_u);
++
++    switch (io_u->ddir)
++    {
++    case DDIR_READ:
++    case DDIR_WRITE:
++        // check for input sanity
++        if (io_u->offset % sd->aduSize != 0)
++        {
++            log_err("sef: Offset is not align to block size\n");
++            io_u->error = -1;
++            return FIO_Q_COMPLETED;
++        }
++
++        if (io_u->xfer_buflen % sd->aduSize != 0)
++        {
++            log_err("sef: Buflen is not align to block size\n");
++            io_u->error = -1;
++            return FIO_Q_COMPLETED;
++        }
++
++        // create the io data
++        ioData = calloc(1, sizeof(struct io_data));
++        ioData->sefData = td->io_ops_data;
++        ioData->ioUnit = io_u;
++        ioData->complete = SEF_IO_U_IN_FLIGHT;
++
++        // create the iov
++        iov = calloc(1, sizeof(struct iovec));
++        iov->iov_base = io_u->xfer_buf;
++        iov->iov_len = io_u->xfer_buflen;
++
++        // prepare and submit to SEF block IO
++        multiContext = calloc(1, sizeof(struct SEFMultiContext));
++        multiContext->blockHandle = sd->context;
++        multiContext->lba = (io_u->offset + sd->aduSize - 1) / sd->aduSize;
++        multiContext->lbc = (io_u->xfer_buflen + sd->aduSize - 1) / sd->aduSize;
++        multiContext->completion = fio_sef_completed;
++        multiContext->arg = ioData;
++        multiContext->iov = iov;
++        multiContext->iovcnt = 1;
++        multiContext->iovOffset = 0;
++        multiContext->ioWeight = io_u->ddir == DDIR_READ ? options->readWeight : options->writeWeight;
++        multiContext->readQueue = options->readQueue;
++        multiContext->ioType = io_u->ddir;
++        multiContext->placementID = (struct SEFPlacementID){options->placementId};
++        if (sd->zeroCopy)
++            multiContext->flags |= kSEFBlockIOFlagNotifyBufferRelease;
++
++        // add request to the inflight list
++        pthread_mutex_lock(&sd->inFlightLock);
++
++        ioData->link = sd->inFlight;
++        sd->inFlight = ioData;
++        sd->inFlightCount++;
++
++        pthread_mutex_unlock(&sd->inFlightLock);
++
++        // submit IO request
++        status = SEFBlockIO(multiContext);
++        if (status.error)
++        {
++            log_err("sef: Was unable to submit IO request\n");
++            io_u->error = status.error;
++
++            // add request to the inflight list
++            pthread_mutex_lock(&sd->inFlightLock);
++
++            sef_remove_inflight(ioData, sd);
++
++            pthread_mutex_unlock(&sd->inFlightLock);
++
++            return FIO_Q_COMPLETED;
++        }
++
++        return FIO_Q_QUEUED;
++
++    case DDIR_TRIM:
++        // submit Trim request
++        status = SEFBlockTrim(sd->context, (io_u->offset + sd->aduSize - 1) / sd->aduSize, 
++                                (io_u->xfer_buflen + sd->aduSize - 1) / sd->aduSize);
++        if (status.error)
++        {
++            log_err("sef: Was unable to compelte trim request\n");
++            io_u->error = status.error;
++        }
++
++        return FIO_Q_COMPLETED;
++
++    default:
++        log_err("sef: Not supported IO request\n");
++        io_u->error = -1;
++        return FIO_Q_COMPLETED;
++    }
++}
++
++static int fio_sef_open(struct thread_data *td, struct fio_file *f)
++{
++    return 0;
++}
++
++#if CC_MAX_WRITE_IO
++uint32_t fio_calc_req_io(struct thread_data *td, struct sef_block_data *sbd)
++{
++    uint32_t req_io = 0;
++    uint32_t req_adus;
++    uint32_t min_bs = MAX(td->o.min_bs[DDIR_WRITE],4096);
++
++    if (td->o.td_ddir & TD_DDIR_WRITE) {
++        req_adus = sbd->ndpsb * CC_MIN_WRITE_ADUS;
++        req_io = DIV_ROUND_UP(req_adus, min_bs/4096);
++    }
++    return req_io;
++}
++#endif
++
++// decrements openCnt and frees resource is count goes to 0
++static void fio_sef_close_block(struct thread_data *td,
++                                struct sef_block_data *sbd)
++{
++    struct sef_options *options = td->eo;
++
++    pthread_mutex_lock(&sbd->lock);
++    assert(sbd->openCnt > 0);
++    if (!--sbd->openCnt)
++    {
++        struct SEFStatus status = {0};
++
++        if (sbd->context)
++            status = SEFBlockCleanup(&sbd->context);
++        sbd->context = NULL;
++        if (status.error)
++            log_err("sef: Was unable to shut down block with error %d\n", status.error);
++    }
++#if CC_MAX_WRITE_IO
++    if (--sbd->plids[options->placementId] == 0)
++    {
++        uint32_t req_io = fio_calc_req_io(td, sbd);
++        atomic_fetch_sub(&sef_req_io, req_io);
++    }
++#endif
++    pthread_mutex_unlock(&sbd->lock);
++}
++
++
++static void fio_sef_notify(struct SEFBlockNotify notification, void * p ) {
++    struct thread_data * td = p;
++    struct sef_data * sd = td->io_ops_data;
++    if (notification.type == kSefBlockNotifyBufferRelease && sd->zeroCopy) {
++        struct io_data *iod;
++        pthread_mutex_lock(&sd->inFlightLock);
++        iod = sd->inFlight;
++        while (iod)
++        {
++            if (iod->complete == SEF_IO_U_NEEDS_BUF)
++            {
++                iod->ioUnit->buf = notification.iov->iov_base;
++                assert(iod->ioUnit->buf);
++                iod->complete = SEF_IO_U_COMPLETE;
++                pthread_mutex_unlock(&sd->inFlightLock);
++                return;
++            }
++            iod = iod->link;
++        }
++        pthread_mutex_unlock(&sd->inFlightLock);
++        buddy_free_pages(&sd->buddy_alloc, notification.iov->iov_base, notification.iov->iov_len/sd->aduSize);
++    }
++}
++
++// Initializes members of sbd if req and increments openCnt
++static struct SEFStatus fio_sef_open_block(
++    struct thread_data *td,
++    struct sef_block_data *sbd)
++{
++    struct sef_options * options = td->eo;
++    struct SEFStatus status = {0};
++    pthread_mutex_lock(&sbd->lock);
++
++    assert(sbd->openCnt >= 0);
++    if (sbd->openCnt == 0)
++    {
++        struct SEFBlockInfo blockInfo;
++        struct SEFQoSDomainID qId;
++        struct SEFBlockOption block_options = {.notifyContext = td, .notifyFunc = fio_sef_notify};
++        assert(sbd->context == NULL);
++
++        if (options->instrumentationPath != NULL && strlen(options->instrumentationPath) > 0)
++            block_options.instrumentationPath = options->instrumentationPath;
++
++        // init sef block module
++        qId.id = (uint16_t)options->qosDomainIdInt;
++        status = SEFBlockInit(options->sefUnitIndex, qId, &block_options,
++                              &sbd->context);
++        switch (status.error)
++        {
++            case 0:
++                break;
++
++            case EBADF:
++            case -EBADF:
++                log_err("sef: The block module was not shutdown cleanly; Consider running Check Disk\n");
++                pthread_mutex_unlock(&sbd->lock);
++                return status;
++
++            default:
++                log_err("sef: Was unable to initialize block with error %d\n", status.error);
++                pthread_mutex_unlock(&sbd->lock);
++                return status;
++        }
++
++        SEFBlockGetInfo(sbd->context, &blockInfo);
++        sbd->aduSize = blockInfo.aduSize.data;
++        sbd->numPlacementId = blockInfo.numPlacementIDs;
++        sbd->capacity = blockInfo.capacity;
++        sbd->numDomains = blockInfo.numDomains;
++#if CC_MAX_WRITE_IO
++    {
++        const struct SEFInfo *sefInfo;
++        uint32_t blockSize;
++
++        sefInfo = SEFGetInformation(SEFGetHandle(sbd->sefUnitIndex));
++        blockSize = sefInfo->numPages * sefInfo->numPlanes * sefInfo->pageSize / 4096;
++        sbd->ndpsb = blockInfo.superBlockSize / blockSize;
++        sbd->plids = calloc(sbd->numPlacementId,sizeof(sbd->plids[0]));
++    }
++#endif
++    }
++    else
++    {
++        log_info("sef: Previously created block was retrieved\n");
++    }
++#if CC_MAX_WRITE_IO
++    if (sbd->plids[options->placementId] == 0)
++    {
++        uint32_t req_io;
++        uint32_t total_req_io;
++
++        req_io = fio_calc_req_io(td, sbd);
++        total_req_io = atomic_fetch_add(&sef_req_io, req_io) + req_io;
++        if (total_req_io > CC_MAX_WRITE_IO) {
++            log_err("sef: job may dead lock with %d I/Os required\n", total_req_io);
++            if (options->stop_on_dl_warn) {
++                atomic_fetch_sub(&sef_req_io, req_io);
++                if (sbd->openCnt == 0)
++                    SEFBlockCleanup(&sbd->context);
++                pthread_mutex_unlock(&sbd->lock);
++                status.error = -EINVAL;
++                raise(SIGTERM);
++                return status;
++            }
++        }
++    }
++    sbd->plids[options->placementId]++;
++#endif
++    sbd->openCnt++;
++    pthread_mutex_unlock(&sbd->lock);
++    return status;
++}
++
++// decrements refcnt of sbd and frees resources if 0
++static void fio_sef_put_block(struct sef_block_data *sbd)
++{
++    pthread_mutex_lock(&libMutex);
++    assert(sbd->refCnt > 0);
++    if (!--sbd->refCnt)
++    {
++        assert(!sbd->openCnt);
++        pthread_mutex_destroy(&sbd->lock);
++        LIST_REMOVE(sbd, link);
++#if CC_MAX_WRITE_IO
++        free(sbd->plids);
++#endif
++        free(sbd);
++    }
++    pthread_mutex_unlock(&libMutex);
++}
++
++// Creates block data if required and increments ref cnt
++static struct sef_block_data *fio_sef_get_block(struct sef_options *options)
++{
++    struct sef_block_data *sbd;
++
++    pthread_mutex_lock(&libMutex);
++    LIST_FOREACH(sbd, &blockData, link)
++    {
++        if (sbd->qosDomainId.id == (uint16_t)options->qosDomainIdInt &&
++            sbd->sefUnitIndex == (int)options->sefUnitIndex)
++            break;
++    }
++
++    if (!sbd)
++    {
++        sbd = calloc(1, sizeof(*sbd));
++        pthread_mutex_init(&sbd->lock, NULL);
++        if (options)
++        {
++            sbd->qosDomainId.id = (uint16_t)options->qosDomainIdInt;
++            sbd->sefUnitIndex = options->sefUnitIndex;
++        }
++        LIST_INSERT_HEAD(&blockData, sbd, link);
++    }
++    sbd->refCnt++;
++    pthread_mutex_unlock(&libMutex);
++    return sbd;
++}
++
++// called at the end of the fio job
++static void fio_sef_cleanup(struct thread_data *td)
++{
++    struct SEFStatus status;
++    struct sef_data *sd = td->io_ops_data;
++    struct sef_block_data *sbd = sd ? sd->sbd : NULL;
++
++    if (sbd)
++    {
++        fio_sef_close_block(td, sbd);
++        fio_sef_put_block(sbd);
++    }
++
++    // clean up sef library
++    status = SEFLibraryCleanup();
++    if (status.error)
++    {
++        log_err("sef: Was unable to cleanup the SEF library with error %d\n", status.error);
++    }
++
++    // clean thread data
++    if (td->io_ops_data)
++    {
++        free(((struct sef_data *)td->io_ops_data)->completedIoU);
++        free(td->io_ops_data);
++    }
++}
++
++static int fio_sef_init(struct thread_data *td)
++{
++    struct SEFStatus status;
++    struct sef_options *options = td->eo;
++    struct sef_data *sd;
++    struct sef_block_data *sbd;
++
++#ifdef SIMULATOR
++    // set the simulator config
++    SEFSimSetDeviceConfig(options->sefSimConfig);
++#endif /* SIMULATOR */
++
++    if (!td->o.use_thread)
++    {
++        log_err("sef: sef engine requires threaded flag to be set");
++        return ENOTSUP;
++    }
++
++    status = SEFLibraryInit();
++    if (status.error)
++    {
++        log_err("sef: Was unable to initialize SEF Library with error %d\n", status.error);
++        return status.error;
++    }
++
++    // populate the id if using label
++    status = fio_sef_get_qos_domain_id(options);
++    if (status.error)
++        return status.error;
++
++    // two step to avoid holding two locks at once
++    sbd = fio_sef_get_block(options);
++    status = fio_sef_open_block(td, sbd);
++
++    if (status.error)
++    {
++        fio_sef_put_block(sbd);
++        return status.error;
++    }
++
++    // create and init sef data
++    sd = (struct sef_data *)malloc(sizeof(*sd));
++    memset(sd, 0, sizeof(*sd));
++
++    sd->completedIoU = (struct io_u **)malloc(td->o.iodepth * sizeof(struct io_u *));
++    memset(sd->completedIoU, 0, td->o.iodepth * sizeof(struct io_u *));
++
++    // update thread data
++    td->io_ops_data = sd;
++    assert(td->io_ops_data);
++
++    // set SEF Data from block data
++    sd->sbd = sbd;
++    sd->context = sbd->context;
++    sd->aduSize = sbd->aduSize;
++    sd->qosDomainId = sbd->qosDomainId;
++    sd->sefUnitIndex = sbd->sefUnitIndex;
++    sd->zeroCopy = options->zeroCopy;
++    sd->numDomains = sbd->numDomains;
++
++    pthread_mutex_init(&sd->inFlightLock, NULL);
++    pthread_cond_init(&sd->completedFlightIO, NULL);
++
++    log_info("sef: initialized block successfully: zero copy= %d\n",sd->zeroCopy);
++
++    return 0; // success
++}
++
++// assumed caller either holds the sdb lock or an sbd openCnt
++static struct SEFStatus fio_sef_get_block_info(struct sef_options *options,
++                                               struct sef_block_data *sbd,
++                                               struct SEFBlockInfo *bi)
++{
++    struct SEFStatus status = {0};
++    unsigned int sefUnitIndex = options->sefUnitIndex;
++    struct SEFQoSDomainID qosDomainId;
++    struct SEFBlockOption blockOption = {.delayMount=true};
++    SEFBlockHandle blockHandle;
++
++    qosDomainId.id = (uint16_t)options->qosDomainIdInt;
++
++    if (sbd->openCnt)
++    {
++        assert(sbd->context);
++        SEFBlockGetInfo(sbd->context, bi);
++        return status;
++    }
++
++    status = SEFBlockInit(sefUnitIndex, qosDomainId, &blockOption, &blockHandle);
++    if (status.error == -ENOENT)
++    {
++        log_info("sef: Block isn't configured, will configure using default values\n");
++
++        // configure the device
++        status = SEFBlockConfig(sefUnitIndex, qosDomainId, NULL);
++        switch (status.error)
++        {
++            case 0:
++                break;
++
++            case EEXIST:
++            case -EEXIST:
++                log_err("sef: The device is already configured, can not reconfigure a pre-configured device\n");
++                return status;
++
++            case EBADF:
++            case -EBADF:
++                log_err("sef: The block module was not shutdown cleanly; Consider running Check Disk\n");
++                return status;
++
++            default:
++                log_err("sef: Was unable to configure Block with default values, Error: %d\n", status.error);
++                return status;
++        }
++
++        // get the configured values
++        status = SEFBlockInit(sefUnitIndex, qosDomainId, &blockOption, &blockHandle);
++    }
++
++    if (status.error)
++    {
++        log_err("sef: Was unable to get Block info, Error: %d\n", status.error);
++        return status;
++    }
++    SEFBlockGetInfo(blockHandle, bi);
++    SEFBlockCleanup(&blockHandle);
++    return status;
++}
++
++static int fio_sef_get_size(struct thread_data *td, struct fio_file *file)
++{
++    struct SEFStatus status, statusLib;
++    struct sef_options *options = td->eo;
++    struct sef_block_data *sbd;
++    struct SEFBlockInfo blockInfo = {0};
++
++#ifdef SIMULATOR
++    // set the simulator config
++    SEFSimSetDeviceConfig(options->sefSimConfig);
++#endif /* SIMULATOR */
++
++    statusLib = SEFLibraryInit();
++    if (statusLib.error)
++    {
++        log_err("sef: Was unable to initialize SEF Library with error %d\n", statusLib.error);
++        return statusLib.error;
++    }
++
++    // populate the id if using label
++    status = fio_sef_get_qos_domain_id(options);
++    if (status.error)
++        return status.error;
++
++    // sbd used for per-domain lock
++    sbd = fio_sef_get_block(options);
++    pthread_mutex_lock(&sbd->lock);
++    status = fio_sef_get_block_info(options, sbd, &blockInfo);
++    pthread_mutex_unlock(&sbd->lock);
++    fio_sef_put_block(sbd);
++
++    statusLib = SEFLibraryCleanup();
++    if (statusLib.error)
++    {
++        log_err("sef: Was unable to cleanup the SEF library with error %d\n", statusLib.error);
++    }
++
++    if (!status.error)
++    {
++        // populate FIO file variable
++        file->file_offset = 0;
++        file->real_file_size = blockInfo.capacity * blockInfo.aduSize.data;
++        file->io_size = blockInfo.aduSize.data;
++        log_info("sef: Device Size: %" PRId64 "\n", file->real_file_size);
++        log_info("sef: Device IO Size: %" PRId64 "\n", file->io_size);
++    }
++    return status.error;
++}
++
++static int fio_sef_alloc(struct thread_data *td, size_t size) {
++    struct sef_data * sd = td->io_ops_data;
++    int ret,order;
++
++    if (!sd->zeroCopy) {
++         td->orig_buffer = malloc(size);
++         if (td->orig_buffer)
++            return 0;
++        return -ENOMEM;
++    }
++
++    if (size < VWB_SIZE) {
++        size = VWB_SIZE + (size - (VWB_SIZE % size));
++    }
++    order = GET_ORDER(NEXT_POWER_2(size) / sd->aduSize);
++    if ((ret = buddy_init(&sd->buddy_alloc, order, sd->aduSize)) == 0) {
++   	    td->orig_buffer = buddy_alloc_pages(&sd->buddy_alloc, size / sd->aduSize);
++    }
++
++    return ret;
++}
++
++static void fio_sef_free(struct thread_data *td) {
++    struct sef_data *sd = td->io_ops_data;
++    if (sd && sd->zeroCopy)
++        buddy_destroy(&sd->buddy_alloc);
++    else
++        free(td->orig_buffer);
++}
++
++
++static struct ioengine_ops ioengine =
++    {
++        .name = "sef",
++        .version = FIO_IOOPS_VERSION,
++        .queue = fio_sef_queue,
++        .getevents = fio_sef_getevents,
++        .event = fio_sef_event,
++        .init = fio_sef_init,
++        .cleanup = fio_sef_cleanup,
++        .get_file_size = fio_sef_get_size,
++        .open_file = fio_sef_open,
++        .commit = fio_sef_commit,
++        .options = options,
++        .option_struct_size = sizeof(struct sef_options),
++        .flags = FIO_DISKLESSIO,
++        .iomem_alloc = fio_sef_alloc,
++        .iomem_free = fio_sef_free,
++};
++
++static void fio_init fio_sef_register(void)
++{
++    register_ioengine(&ioengine);
++}
++
++static void fio_exit fio_sef_unregister(void)
++{
++    unregister_ioengine(&ioengine);
++}
+diff --git a/examples/sef.fio b/examples/sef.fio
+new file mode 100644
+index 00000000..840428c9
+--- /dev/null
++++ b/examples/sef.fio
+@@ -0,0 +1,17 @@
++# Assumes that SEF Unit 0 is being used and a QoS Domain with Label "613006,88877" is created
++# To set up this example, the script is provided in "Quick Smoke Test" section of the "SDK Document"
++
++[global]
++ioengine=sef
++sef_unit_index=0
++bs=32k
++time_based=1
++runtime=600
++verify=md5
++iodepth=16
++thread
++
++[sef-read-write]
++qos_domain_label=613006,88877
++rw=randrw
++size=100%
+diff --git a/optgroup.h b/optgroup.h
+index 024b902f..1eda87f5 100644
+--- a/optgroup.h
++++ b/optgroup.h
+@@ -71,6 +71,7 @@ enum opt_category_group {
+ 	__FIO_OPT_G_LIBCUFILE,
+ 	__FIO_OPT_G_DFS,
+ 	__FIO_OPT_G_NFS,
++	__FIO_OPT_G_SEF,
+ 	__FIO_OPT_G_WINDOWSAIO,
+ 	__FIO_OPT_G_XNVME,
+ 	__FIO_OPT_G_LIBBLKIO,
+@@ -112,13 +113,14 @@ enum opt_category_group {
+ 	FIO_OPT_G_SG		= (1ULL << __FIO_OPT_G_SG),
+ 	FIO_OPT_G_MMAP		= (1ULL << __FIO_OPT_G_MMAP),
+ 	FIO_OPT_G_INVALID	= (1ULL << __FIO_OPT_G_NR),
+-	FIO_OPT_G_ISCSI         = (1ULL << __FIO_OPT_G_ISCSI),
++	FIO_OPT_G_ISCSI		= (1ULL << __FIO_OPT_G_ISCSI),
+ 	FIO_OPT_G_NBD		= (1ULL << __FIO_OPT_G_NBD),
+ 	FIO_OPT_G_NFS		= (1ULL << __FIO_OPT_G_NFS),
+ 	FIO_OPT_G_IOURING	= (1ULL << __FIO_OPT_G_IOURING),
+ 	FIO_OPT_G_FILESTAT	= (1ULL << __FIO_OPT_G_FILESTAT),
+ 	FIO_OPT_G_LIBCUFILE	= (1ULL << __FIO_OPT_G_LIBCUFILE),
+ 	FIO_OPT_G_DFS		= (1ULL << __FIO_OPT_G_DFS),
++	FIO_OPT_G_SEF		= (1ULL << __FIO_OPT_G_SEF),
+ 	FIO_OPT_G_WINDOWSAIO	= (1ULL << __FIO_OPT_G_WINDOWSAIO),
+ 	FIO_OPT_G_XNVME         = (1ULL << __FIO_OPT_G_XNVME),
+ 	FIO_OPT_G_LIBBLKIO	= (1ULL << __FIO_OPT_G_LIBBLKIO),

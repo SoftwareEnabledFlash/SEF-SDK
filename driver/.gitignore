@@ -1,0 +1,37 @@
+      .Module.symvers.cmd
+        .modules.order.cmd
+        .sef.ko.cmd
+        .sef.mod.cmd
+        .sef.mod.o.cmd
+        .sef.o.cmd
+        .sef_aen.o.cmd
+        .sef_core.o.cmd
+        .sef_sys.o.cmd
+        Module.symvers
+        gitignore
+        modules.order
+        sef.ko
+        sef.mod
+        sef.mod.c
+        sef.mod.o
+        sef.o
+        sef_aen.o
+        sef_core.o
+        sef_sys.o
+#
+.*
+*.ko
+*.mod
+*.mod.c
+*.o
+Module.symvers
+modules.order
+
+!.clang-format
+!.gitattributes
+!.gitignore
+
+*.orig
+*~
+\#*#
+

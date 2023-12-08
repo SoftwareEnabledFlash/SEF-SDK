@@ -1,0 +1,3000 @@
+diff --git a/.gitignore b/.gitignore
+index 61fa39967b..92bdc93683 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -20,3 +20,6 @@ GTAGS
+ *.swp
+ *.patch
+ *.gcov
++# IDE directory
++.vs
++.vscode
+diff --git a/block/meson.build b/block/meson.build
+index 382bec0e7d..44d8e0c61a 100644
+--- a/block/meson.build
++++ b/block/meson.build
+@@ -89,6 +89,7 @@ if not get_option('replication').disabled()
+ endif
+ block_ss.add(when: libaio, if_true: files('linux-aio.c'))
+ block_ss.add(when: linux_io_uring, if_true: files('io_uring.c'))
++block_ss.add(when: ['CONFIG_SEF', sef], if_true: files('sef.c'))
+ 
+ block_modules = {}
+ 
+diff --git a/block/sef.c b/block/sef.c
+new file mode 100644
+index 0000000000..84c43ec6f0
+--- /dev/null
++++ b/block/sef.c
+@@ -0,0 +1,639 @@
++/*
++ * SOFTWARE-ENABLED FLASH (“SEF”)
++ * Software Development Kit (SDK)
++ * sef.c
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * This software is licensed under the 3-Clause BSD License.
++ *
++ * Copyright (C) 2018-2023 - KIOXIA Corporation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * 3. Neither the name of the copyright holder nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qmp/qdict.h"
++#include "qapi/qmp/qstring.h"
++#include "qemu/module.h"
++#include "qemu/option.h"
++#include "block/block_int.h"
++#include "block/block-io.h"
++
++#include <pthread.h>
++#include <SEFAPI.h>
++#ifdef SEF_SIMULATOR
++    #include <SEFSim.h>
++#endif /* SIMULATOR */
++#include <sef-block-module.h>
++
++#define SEF_OPT_LATENCY "latency-ns"
++#define SEF_OPT_ZEROES  "read-zeroes"
++
++static pthread_mutex_t seflibMutex = PTHREAD_MUTEX_INITIALIZER;
++
++typedef struct {
++    int64_t length;
++    int64_t latency_ns;
++    bool read_zeroes;
++    struct sef_block_data *blokData;
++} BDRVSEFState;
++
++struct sef_block_data
++{
++    int sefUnitIndex;
++    struct SEFQoSDomainID qosDomainId;
++#ifdef SEF_SIMULATOR
++    char *simulatorConfig;
++#endif /* SIMULATOR */
++    SEFBlockHandle context;
++};
++
++static int parse_filename(const char *filename, QDict *options, struct sef_block_data *blockData, Error **errp)
++{
++    int numTokens;
++    char inputFileName[1024], *filenameSplit;
++
++    numTokens = 0;
++    strcpy(inputFileName, filename);
++    filenameSplit = strtok(inputFileName, ":");
++
++    blockData->sefUnitIndex = -1;
++    blockData->qosDomainId.id = -1;
++    while (filenameSplit)
++    {
++        switch (numTokens)
++        {
++        case 0:
++            blockData->sefUnitIndex = atoi(filenameSplit);
++            qdict_put_int(options, "sefUnitIndex", blockData->sefUnitIndex);
++            break;
++        case 1:
++            blockData->qosDomainId.id = atoi(filenameSplit);
++            qdict_put_int(options, "qosDomainId", blockData->qosDomainId.id);
++            break;
++#ifdef SEF_SIMULATOR
++        case 2:
++            blockData->simulatorConfig = malloc(sizeof(char) * strlen(filenameSplit));
++            strcpy(blockData->simulatorConfig, filenameSplit);
++            qdict_put_str(options, "simulatorConfig", filenameSplit);
++            SEFSimSetDeviceConfig(blockData->simulatorConfig);
++            break;
++#endif /* SIMULATOR */
++        }
++
++        numTokens++;
++        filenameSplit = strtok(NULL, ":");
++    }
++
++    if (blockData->sefUnitIndex == -1 || blockData->qosDomainId.id == (uint16_t)-1)
++    {
++        error_setg(errp, "Wrong input for the file. use: SEFUnitId:QoSDomain:SEFSimConfigLocation");
++        return -1;
++    }
++
++    return 0;
++}
++
++    static QemuOptsList runtime_opts = {
++        .name = "sef",
++        .head = QTAILQ_HEAD_INITIALIZER(runtime_opts.head),
++        .desc = {
++            {
++                .name = BLOCK_OPT_SIZE,
++                .type = QEMU_OPT_SIZE,
++                .help = "size of the SEF block",
++            },
++            {
++                .name = SEF_OPT_LATENCY,
++                .type = QEMU_OPT_NUMBER,
++                .help = "nanoseconds (approximated) to wait "
++                        "before completing request",
++            },
++            {
++                .name = SEF_OPT_ZEROES,
++                .type = QEMU_OPT_BOOL,
++                .help = "return zeroes when read",
++            },
++            {/* end of list */}},
++};
++
++static void sef_co_parse_filename(const char *filename, QDict *options,
++                                   Error **errp)
++{
++    /* This functions only exists so that a sef-co:// filename is accepted
++     * with the sef-co driver. */
++    if (strcmp(filename, "sef-co://")) {
++        error_setg(errp, "The only allowed filename for this driver is "
++                         "'sef-co://'");
++        return;
++    }
++}
++
++static void sef_aio_parse_filename(const char *filename, QDict *options,
++                                    Error **errp)
++{
++    struct SEFStatus status;
++    SEFHandle sefHandle;
++    struct SEFQoSDomainList *qosList;
++    struct SEFBlockInfo blockInfo;
++    struct sef_block_data blockData;
++    char qosListBuffer[16384];
++    int i, isQoSValid;
++
++    pthread_mutex_lock(&seflibMutex);
++
++    // parse the input filename
++    if (parse_filename(filename, options, &blockData, errp) != 0)
++        return;
++
++    // init the SEF Library
++    status = SEFLibraryInit();
++    if (status.error)
++    {
++        error_setg(errp, "Was unable to init the SEF Library");
++        return;
++    }
++
++    // get the handle for the SEF Unit
++    sefHandle = SEFGetHandle(blockData.sefUnitIndex);
++    if (!sefHandle)
++    {
++        error_setg(errp, "Was unable to access SEF Unit with Index %d", blockData.sefUnitIndex);
++        return;
++    }
++
++    // get list of the the available qos domains
++    qosList = (struct SEFQoSDomainList *) qosListBuffer;
++    status = SEFListQoSDomains(sefHandle, qosList, sizeof(qosListBuffer));
++    if (status.error)
++    {
++        error_setg(errp, "Was unabled to get list of QoS Domains");
++        return;
++    }
++
++    // validate qos domain id
++    isQoSValid = 0;
++    for (i = 0; i < qosList->numQoSDomains; i++)
++    {
++        if (qosList->QoSDomainID[i].id == blockData.qosDomainId.id)
++            isQoSValid = 1;
++    }
++
++    if (!isQoSValid)
++    {
++        error_setg(errp, "The QoS Domain Id %d was invalid", blockData.qosDomainId.id);
++        return;
++    }
++
++    struct SEFBlockOption blockOptions = {.delayMount = true};
++    status = SEFBlockInit(0, blockData.qosDomainId, &blockOptions, &blockData.context);
++    SEFBlockGetInfo(blockData.context, &blockInfo);
++    if (status.error == -ENOENT)
++    {
++        struct SEFBlockConfig blockConfig = {0};
++        blockConfig.numDomains = 1;
++        // configure the device with
++        status = SEFBlockConfig(blockData.sefUnitIndex, blockData.qosDomainId, &blockConfig);
++        if (status.error)
++        {
++            error_setg(errp, "Was unable to configure SEF Block with default values, Error: %d\n", status.error);
++
++            SEFLibraryCleanup();
++            return;
++        }
++
++        // get the configured values
++        SEFBlockGetInfo(blockData.context, &blockInfo);
++	/*
++        if (status.error)
++        {
++            error_setg(errp, "Was unable to get block info after configuration, Error: %d\n", status.error);
++            return;
++        }
++	*/
++    }
++    else if (status.error)
++    {
++        SEFLibraryCleanup();
++
++        error_setg(errp, "Was unable to get SEF Block Info, Error: %d\n", status.error);
++        return;
++    }
++
++    // set the block device size for the OS
++    qdict_put_int(options, BLOCK_OPT_SIZE, blockInfo.capacity * blockInfo.aduSize.data);
++
++    // clean up the sef library
++    SEFLibraryCleanup();
++
++    pthread_mutex_unlock(&seflibMutex);
++}
++
++static int sef_file_open(BlockDriverState *bs, QDict *options, int flags,
++                          Error **errp)
++{
++    QemuOpts *opts;
++    struct sef_block_data *blockData;
++    BDRVSEFState *s = bs->opaque;
++    struct SEFStatus status;
++    struct SEFBlockOption blockOptions = {0, NULL, NULL};
++    int ret = 0;
++
++    opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
++    qemu_opts_absorb_qdict(opts, options, &error_abort);
++    s->length = qemu_opt_get_size(opts, BLOCK_OPT_SIZE, 1 << 30);
++    s->latency_ns = qemu_opt_get_number(opts, SEF_OPT_LATENCY, 0);
++    if (s->latency_ns < 0) {
++        error_setg(errp, "latency-ns is invalid");
++        ret = -EINVAL;
++    }
++    s->read_zeroes = qemu_opt_get_bool(opts, SEF_OPT_ZEROES, false);
++    qemu_opts_del(opts);
++    bs->supported_write_flags = BDRV_REQ_FUA;
++
++    pthread_mutex_lock(&seflibMutex);
++
++    // populate sef block data
++    blockData = malloc(sizeof(struct sef_block_data));
++    blockData->sefUnitIndex = qdict_get_int(options, "sefUnitIndex");
++    qdict_del(options, "sefUnitIndex");
++    blockData->qosDomainId.id = qdict_get_int(options, "qosDomainId");
++    qdict_del(options, "qosDomainId");
++#ifdef SEF_SIMULATOR
++    blockData->simulatorConfig = (char*) qdict_get_str(options, "simulatorConfig");
++    qdict_del(options, "simulatorConfig");
++    SEFSimSetDeviceConfig(blockData->simulatorConfig);
++#endif
++
++    // init sef library
++    status = SEFLibraryInit();
++    if (status.error)
++    {
++        error_setg(errp, "SEFLibraryInit failed, was unable to init library");
++        return status.error;
++    }
++
++    // init SEF Block
++    status = SEFBlockInit(blockData->sefUnitIndex, blockData->qosDomainId, &blockOptions, &blockData->context);
++    if (status.error)
++    {
++        error_setg(errp, "SEFBlockInit Failed with SEF Unit Index %d, QoSDomain Id %d", blockData->sefUnitIndex, blockData->qosDomainId.id);
++        ret = status.error;
++    }
++
++    s->blokData = blockData;
++
++    pthread_mutex_unlock(&seflibMutex);
++
++    return ret;
++}
++
++static void sef_close(BlockDriverState *bs)
++{
++    BDRVSEFState *s = bs->opaque;
++    struct sef_block_data *blockData = s->blokData;
++
++    pthread_mutex_lock(&seflibMutex);
++
++    // clean up the sef block
++    SEFBlockCleanup(&blockData->context);
++
++    // clean up block data
++    free(blockData);
++
++    // clean up sef library
++    SEFLibraryCleanup();
++
++    pthread_mutex_unlock(&seflibMutex);
++}
++
++static int64_t sef_getlength(BlockDriverState *bs)
++{
++    BDRVSEFState *s = bs->opaque;
++    return s->length;
++}
++
++static coroutine_fn int sef_co_common(BlockDriverState *bs)
++{
++    BDRVSEFState *s = bs->opaque;
++
++    if (s->latency_ns) {
++        qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, s->latency_ns);
++    }
++    return 0;
++}
++
++static coroutine_fn int sef_co_preadv(BlockDriverState *bs,
++                                       int64_t offset, int64_t bytes,
++                                       QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    BDRVSEFState *s = bs->opaque;
++
++    if (s->read_zeroes) {
++        qemu_iovec_memset(qiov, 0, 0, bytes);
++    }
++
++    return sef_co_common(bs);
++}
++
++static coroutine_fn int sef_co_pwritev(BlockDriverState *bs,
++                                        int64_t offset, int64_t bytes,
++                                        QEMUIOVector *qiov, BdrvRequestFlags flags)
++{
++    return sef_co_common(bs);
++}
++
++static coroutine_fn int sef_co_flush(BlockDriverState *bs)
++{
++    return sef_co_common(bs);
++}
++
++typedef struct {
++    BlockAIOCB common;
++    QEMUTimer timer;
++    QEMUIOVector *qiov;
++    uint64_t bytes;
++    BlockDriverState *bs;
++    BlockCompletionFunc *cb;
++    void *opaque;
++    char read;
++} SEFAIOCB;
++
++static const AIOCBInfo sef_aiocb_info = {
++    .aiocb_size = sizeof(SEFAIOCB),
++};
++
++static void sef_bh_cb(void *opaque)
++{
++    SEFAIOCB *acb = opaque;
++
++    acb->common.cb(acb->common.opaque, 0);
++    qemu_aio_unref(acb);
++}
++
++static inline BlockAIOCB *sef_aio_common(BlockDriverState *bs,
++                                          BlockCompletionFunc *cb,
++                                          SEFAIOCB *acb,
++                                          void *opaque)
++{
++    aio_bh_schedule_oneshot(bdrv_get_aio_context(bs), sef_bh_cb, acb);
++    return &acb->common;
++}
++
++static void multiDone(struct SEFMultiContext *context)
++{
++    SEFAIOCB *acb = (SEFAIOCB *)context->arg;
++    if (context)
++    {
++        free(context);
++    }
++
++    sef_aio_common(acb->bs, acb->cb, acb, acb->opaque);
++}
++
++static BlockAIOCB *sef_aio_preadv(BlockDriverState *bs,
++                                   int64_t offset, int64_t bytes,
++                                   QEMUIOVector *qiov, BdrvRequestFlags flags,
++                                   BlockCompletionFunc *cb,
++                                   void *opaque)
++{
++    SEFAIOCB *acb;
++    BDRVSEFState *s = bs->opaque;
++    struct sef_block_data *blockData = s->blokData;
++    struct SEFMultiContext *context = calloc(1,sizeof(*context));
++    int i;
++    struct SEFStatus status;
++
++    if (!context)
++    {
++        printf("Malloc of context for read failed\n");
++        return NULL;
++    }
++
++    acb = qemu_aio_get(&sef_aiocb_info, bs, cb, opaque);
++    if (!acb)
++    {
++        printf("Malloc of acb for read failed\n");
++        free(context);
++        return NULL;
++    }
++
++    acb->read = 1;
++    acb->qiov = qiov;
++    acb->bytes = bytes;
++    acb->bs = bs;
++    acb->cb = cb;
++    acb->opaque = opaque;
++
++    // prepare Multicontext object for sef block
++    context->blockHandle = blockData->context;
++    context->lba = offset / 4096;
++    context->completion = multiDone;
++    context->arg = acb;
++    context->lbc = bytes / 4096;
++    context->ioType = kSEFRead;
++    context->iov =qiov->iov;
++    context->iovcnt = qiov->niov;
++    context->iovOffset = 0;
++    for (i=0; i<qiov->niov; i++)
++        if (qiov->iov[i].iov_len & 0xfff)
++            printf("buffer %d, base %p, length %lx\n", i, qiov->iov[i].iov_base,qiov->iov[i].iov_len);
++
++    // call sef block io
++    status = SEFBlockIO(context);
++    if (status.error) {
++        context->error = status.error;
++        context->completion(context);
++    }
++    return &acb->common;
++}
++
++static BlockAIOCB *sef_aio_pwritev(BlockDriverState *bs,
++                                    int64_t offset, int64_t bytes,
++                                    QEMUIOVector *qiov, BdrvRequestFlags flags,
++                                    BlockCompletionFunc *cb,
++                                    void *opaque)
++{
++    SEFAIOCB *acb;
++    BDRVSEFState *s = bs->opaque;
++    struct sef_block_data *blockData = s->blokData;
++    struct SEFMultiContext *context = calloc(1,sizeof(*context));
++    int i;
++    struct SEFStatus status;
++
++    if (!context)
++    {
++        printf("Malloc of context for write failed\n");
++        return NULL;
++    }
++
++    acb = qemu_aio_get(&sef_aiocb_info, bs, cb, opaque);
++    if (!acb)
++    {
++        printf("Malloc of acb for write failed\n");
++        free(context);
++        return NULL;
++    }
++
++    acb->read = 0;
++    acb->qiov = qiov;
++    acb->bytes = bytes;
++    acb->bs = bs;
++    acb->cb = cb;
++    acb->opaque = opaque;
++
++    // prepare Multicontext object for sef block
++    context->blockHandle = blockData->context;
++    context->lba = offset / 4096;
++    context->completion = multiDone;
++    context->arg = acb;
++    context->lbc = bytes / 4096;
++    context->ioType = kSEFWrite;
++    context->iov = qiov->iov;
++    context->iovcnt = qiov->niov;
++    context->iovOffset = 0;
++    for (i=0; i<qiov->niov; i++)
++        if (qiov->iov[i].iov_len & 0xfff)
++            printf("buffer %d, base %p, length %lx\n", i, qiov->iov[i].iov_base,qiov->iov[i].iov_len);
++
++    // call sef block io
++    status = SEFBlockIO(context);
++    if (status.error) {
++        context->error = status.error;
++        context->completion(context);
++    }
++    return &acb->common;
++}
++
++static BlockAIOCB *sef_aio_flush(BlockDriverState *bs,
++                                  BlockCompletionFunc *cb,
++                                  void *opaque)
++{
++    SEFAIOCB *acb;
++    acb = qemu_aio_get(&sef_aiocb_info, bs, cb, opaque);
++    acb->read = 0;
++    return sef_aio_common(bs, cb, acb, opaque);
++}
++
++static int sef_probe_blocksizes(BlockDriverState *bs,
++                                 BlockSizes *bsz)
++{
++    bsz->phys = 16384;
++    bsz->log = 4096;
++    return 0;
++}
++
++static int sef_reopen_prepare(BDRVReopenState *reopen_state,
++                               BlockReopenQueue *queue, Error **errp)
++{
++    return 0;
++}
++
++static int coroutine_fn sef_co_block_status(BlockDriverState *bs,
++                                             bool want_zero, int64_t offset,
++                                             int64_t bytes, int64_t *pnum,
++                                             int64_t *map,
++                                             BlockDriverState **file)
++{
++    BDRVSEFState *s = bs->opaque;
++    int ret = BDRV_BLOCK_OFFSET_VALID;
++
++    *pnum = bytes;
++    *map = offset;
++    *file = bs;
++
++    if (s->read_zeroes) {
++        ret |= BDRV_BLOCK_ZERO;
++    }
++    return ret;
++}
++
++static void sef_refresh_filename(BlockDriverState *bs)
++{
++    QDict *opts;
++
++    opts = bs->full_open_options;
++
++    qdict_del(opts, "filename");
++
++    if (!qdict_size(opts)) {
++        snprintf(bs->exact_filename, sizeof(bs->exact_filename), "%s://",
++                 bs->drv->format_name);
++    }
++
++    qdict_put_str(opts, "driver", bs->drv->format_name);
++    bs->full_open_options = qobject_ref(opts);
++}
++
++static BlockDriver bdrv_sef_co = {
++    .format_name            = "sef-co",
++    .protocol_name          = "sef-co",
++    .instance_size          = sizeof(BDRVSEFState),
++
++    .bdrv_file_open         = sef_file_open,
++    .bdrv_parse_filename    = sef_co_parse_filename,
++    .bdrv_close             = sef_close,
++    .bdrv_co_getlength      = sef_getlength,
++
++    .bdrv_co_preadv         = sef_co_preadv,
++    .bdrv_co_pwritev        = sef_co_pwritev,
++    .bdrv_co_flush_to_disk  = sef_co_flush,
++    .bdrv_reopen_prepare    = sef_reopen_prepare,
++
++    .bdrv_co_block_status   = sef_co_block_status,
++
++    .bdrv_refresh_filename  = sef_refresh_filename,
++};
++
++static BlockDriver bdrv_sef_aio = {
++    .format_name            = "sef-aio",
++    .protocol_name          = "sef-aio",
++    .instance_size          = sizeof(BDRVSEFState),
++
++    .bdrv_file_open         = sef_file_open,
++    .bdrv_parse_filename    = sef_aio_parse_filename,
++    .bdrv_close             = sef_close,
++    .bdrv_co_getlength      = sef_getlength,
++
++    .bdrv_aio_preadv        = sef_aio_preadv,
++    .bdrv_aio_pwritev       = sef_aio_pwritev,
++    .bdrv_aio_flush         = sef_aio_flush,
++    .bdrv_reopen_prepare    = sef_reopen_prepare,
++
++    .bdrv_co_block_status   = sef_co_block_status,
++
++    .bdrv_refresh_filename  = sef_refresh_filename,
++    .bdrv_probe_blocksizes  = sef_probe_blocksizes,
++};
++
++static void bdrv_sef_init(void)
++{
++    bdrv_register(&bdrv_sef_co);
++    bdrv_register(&bdrv_sef_aio);
++}
++
++block_init(bdrv_sef_init);
+diff --git a/configure b/configure
+index 800b5850f4..db1777da8e 100755
+--- a/configure
++++ b/configure
+@@ -279,6 +279,9 @@ debug_tcg="no"
+ sanitizers="no"
+ tsan="no"
+ fortify_source="yes"
++sef="yes"
++sef_lib_type="no"
++sef_emu="yes"
+ EXESUF=""
+ modules="no"
+ prefix="/usr/local"
+@@ -891,6 +894,16 @@ for opt do
+   ;;
+   --gdb=*) gdb_bin="$optarg"
+   ;;
++  --disable-sef) sef="no"
++  ;;
++  --enable-sef) sef="yes"
++  ;;
++  --sef-lib-type=*) sef_lib_type="$optarg"
++  ;;
++  --disable-sef-emu) sef_emu="no"
++  ;;
++  --enable-sef-emu) sef_emu="yes"
++  ;;
+   --enable-vfio-user-server) vfio_user_server="enabled"
+   ;;
+   --disable-vfio-user-server) vfio_user_server="disabled"
+@@ -1048,6 +1061,9 @@ cat << EOF
+   debug-info      debugging information
+   safe-stack      SafeStack Stack Smash Protection. Depends on
+                   clang/llvm and requires coroutine backend ucontext.
++  sef             SEF driver support
++  sef-lib-type    Set the library that should be used for sef (valid values: simulator, emulator[default])"
++  sef-emu         SEF emulator support
+ 
+ NOTE: The object files are built at the place where configure is launched
+ EOF
+@@ -1207,6 +1223,18 @@ if ! compile_prog "" "" ; then
+     error_exit "You need at least GCC v7.4 or Clang v10.0 (or XCode Clang v12.0)"
+ fi
+ 
++##########################################
++# SEF Probe
++if test "$sef" != "no" ; then
++  if test "$sef_lib_type" = "sim" || test "$sef_lib_type" = "simulator"; then
++    sef_libs="-lsef-sim -lsef-ftl -lstdc++ -lyaml-cpp"
++    sef_cflags="-DSEF_CORE -DSEF_SIMULATOR"
++  else
++    sef_libs="-lsef -lsef-ftl -lstdc++"
++    sef_cflags=-DSEF_CORE
++  fi
++fi
++
+ # Accumulate -Wfoo and -Wno-bar separately.
+ # We will list all of the enable flags first, and the disable flags second.
+ # Note that we do not add -Werror, because that would enable it for all
+@@ -2493,6 +2521,16 @@ if test "$safe_stack" = "yes"; then
+   echo "CONFIG_SAFESTACK=y" >> $config_host_mak
+ fi
+ 
++if test "$sef" != "no" ; then
++  echo "CONFIG_SEF=y" >> $config_host_mak
++  echo "SEF_CFLAGS=$sef_cflags" >> $config_host_mak
++  echo "SEF_LIBS=$sef_libs" >> $config_host_mak
++fi
++
++if test "$sef_emu" != "no" ; then
++  echo "CONFIG_SEF_EMU=y" >> $config_host_mak
++fi
++
+ # tests/tcg configuration
+ (config_host_mak=tests/tcg/config-host.mak
+ mkdir -p tests/tcg
+diff --git a/contrib/vhost-user-gpu/vhost-user-gpu.c b/contrib/vhost-user-gpu/vhost-user-gpu.c
+index bfb8d93cf8..918c9ca5a8 100644
+--- a/contrib/vhost-user-gpu/vhost-user-gpu.c
++++ b/contrib/vhost-user-gpu/vhost-user-gpu.c
+@@ -352,6 +352,7 @@ vg_resource_create_2d(VuGpu *g,
+                    __func__, c2d.resource_id, c2d.width, c2d.height);
+         vugbm_buffer_destroy(&res->buffer);
+         g_free(res);
++        vugbm_buffer_destroy(&res->buffer);
+         cmd->error = VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY;
+         return;
+     }
+diff --git a/dtc b/dtc
+index b6910bec11..85e5d83984 160000
+--- a/dtc
++++ b/dtc
+@@ -1 +1 @@
+-Subproject commit b6910bec11614980a21e46fbccc35934b671bd81
++Subproject commit 85e5d839847af54efab170f2b1331b2a6421e647
+diff --git a/hw/nvme/ctrl.c b/hw/nvme/ctrl.c
+index ac24eeb5ed..ebcc1ae9f0 100644
+--- a/hw/nvme/ctrl.c
++++ b/hw/nvme/ctrl.c
+@@ -307,6 +307,112 @@ static void nvme_process_sq(void *opaque);
+ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst);
+ static inline uint64_t nvme_get_timestamp(const NvmeCtrl *n);
+ 
++#ifdef SEF_CORE
++static void
++sef_aio_cancel(BlockAIOCB *blockacb)
++{
++    sefAIOCB *acb = (sefAIOCB *)blockacb;
++
++    if (!acb->zns)
++        SEFBlockCancel(&acb->blockIocb);
++}
++
++#ifdef SEF_CORE
++static const AIOCBInfo sef_aiocb_info = {
++    .aiocb_size = sizeof(sefAIOCB),
++    .cancel_async       = sef_aio_cancel,
++};
++
++static void openSuperBlock(NvmeNamespace *ns, uint16_t zoneNumber)
++{
++    struct SEFStatus status;
++    sefContext *sc = ns->sef_context;
++    int qd_idx = zoneNumber % ns->sef_num_domains;
++
++    assert(sc->type == kSefZns);
++    assert(!(sc->zc.zi[zoneNumber].flashAddress.bits));
++    assert(qatomic_load_acquire(&sc->zc.zi[zoneNumber].refCnt) == 0);
++    status = SEFAllocateSuperBlock(sc->zc.qos_handle[qd_idx],
++                                   &sc->zc.zi[zoneNumber].flashAddress,
++                                   sc->zc.pSLC ? kForPSLCWrite : kForWrite,
++                                   NULL, NULL);
++    if (status.error) {
++        error_report("Error allocating superblock err:info %d:%u",
++                    status.error, status.info);
++    } else {
++        qatomic_store_release(&sc->zc.zi[zoneNumber].refCnt, 1);
++        sc->zc.zi[zoneNumber].wp_at_close = 0;
++        sc->zc.zi[zoneNumber].open = true;
++    }
++}
++#endif
++
++static void closeSuperBlockDone(struct SEFCommonIOCB *iocb)
++{
++    if (iocb->status.error) {
++        info_report("Error closing superblock err:info %u:%u",
++                    iocb->status.error, iocb->status.info);
++    }
++    g_free(iocb);
++}
++
++void closeSuperBlock(NvmeNamespace *ns, uint32_t zoneNumber, bool async)
++{
++    sefContext *sc = ns->sef_context;
++    int qd_idx = zoneNumber % ns->sef_num_domains;
++
++    assert(sc->type == kSefZns);
++    /* Avoid unnecessary wear caused by "finishing" an empty zone */
++    if (sc->zc.zi[zoneNumber].flashAddress.bits) {
++        assert(sc->zc.zi[zoneNumber].open);
++        sc->zc.zi[zoneNumber].open = false;
++        /* can't submit blocking calls from SEF library cb thread */
++        if (async) {
++            struct SEFCloseSuperBlockIOCB *iocb = g_malloc0(sizeof(*iocb));
++
++            iocb->common.complete_func = closeSuperBlockDone;
++            iocb->flashAddress = sc->zc.zi[zoneNumber].flashAddress;
++            SEFCloseSuperBlockAsync(sc->zc.qos_handle[qd_idx], iocb);
++        } else {
++            SEFCloseSuperBlock(sc->zc.qos_handle[qd_idx],
++                               sc->zc.zi[zoneNumber].flashAddress);
++        }
++    } else {
++        assert(!sc->zc.zi[zoneNumber].open);
++    }
++}
++
++static void releaseSuperBlock(NvmeNamespace *ns, int zoneNumber)
++{
++    struct SEFStatus status;
++    sefContext *sc = ns->sef_context;
++    int qd_idx = zoneNumber % ns->sef_num_domains;
++
++    assert(sc->type == kSefZns);
++    /* avoid unnecessary wear caused by reseting an empty zone */
++    if (sc->zc.zi[zoneNumber].flashAddress.bits) {
++        /*
++         * todo: fix lib-driver to allow releasing what it thinks is open
++         *       or have open be states, open, closed, closing, releasing so
++         *       close completion can know to release it too
++         */
++        if (sc->zc.zi[zoneNumber].open) {
++            /* transitioned to empty w/o going through full */
++            assert(qatomic_load_acquire(&sc->zc.zi[zoneNumber].refCnt) == 1);
++            qatomic_store_release(&sc->zc.zi[zoneNumber].refCnt, 0);
++            closeSuperBlock(ns, zoneNumber, false);
++        }
++        status = SEFReleaseSuperBlock(sc->zc.qos_handle[qd_idx],
++                                      sc->zc.zi[zoneNumber].flashAddress);
++        if (status.error) {
++            info_report("Error release superblock err:info %u:%u",
++                        status.error, status.info);
++        }
++    }
++    sc->zc.zi[zoneNumber].flashAddress.bits = 0;
++}
++#endif
++
+ static uint16_t nvme_sqid(NvmeRequest *req)
+ {
+     return le16_to_cpu(req->sq->sqid);
+@@ -400,6 +506,24 @@ static void nvme_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone,
+         break;
+     case NVME_ZONE_STATE_FULL:
+         QTAILQ_INSERT_TAIL(&ns->full_zones, zone, entry);
++#ifdef SEF_CORE
++        if (ns->sef) {
++            uint32_t zoneNumber = zone - ns->zone_array;
++            sefContext *sc = ns->sef_context;
++
++            if (qatomic_dec_fetch(&sc->zc.zi[zoneNumber].refCnt) == 0) {
++                closeSuperBlock(ns, zoneNumber, false);
++            }
++        }
++#endif
++        break;
++#ifdef SEF_CORE
++    case NVME_ZONE_STATE_EMPTY:
++        if (ns->sef) {
++            releaseSuperBlock(ns, zone - ns->zone_array);
++        }
++        break;
++#endif
+     case NVME_ZONE_STATE_READ_ONLY:
+         break;
+     default:
+@@ -1927,6 +2051,15 @@ static uint16_t nvme_zrm_finish(NvmeNamespace *ns, NvmeZone *zone)
+ 
+         /* fallthrough */
+     case NVME_ZONE_STATE_EMPTY:
++#ifdef SEF_CORE
++        if (ns->sef) {
++            sefContext *sc = ns->sef_context;
++            size_t zone_idx = zone - ns->zone_array;
++
++            assert(sc->type == kSefZns);
++            sc->zc.zi[zone_idx].wp_at_close = zone->d.wp;
++        }
++#endif
+         nvme_assign_zone_state(ns, zone, NVME_ZONE_STATE_FULL);
+         return NVME_SUCCESS;
+ 
+@@ -2168,6 +2301,32 @@ void nvme_rw_complete_cb(void *opaque, int ret)
+     nvme_enqueue_req_completion(nvme_cq(req), req);
+ }
+ 
++#ifdef SEF_CORE
++static void nvme_fill_data(QEMUSGList *qsg,
++    uint64_t offset, uint8_t pattern)
++{
++    ScatterGatherEntry *entry;
++    uint32_t len, ent_len;
++
++    if (qsg->nsg > 0) {
++        entry = qsg->sg;
++        for (len = qsg->size; len > 0; len -= ent_len) {
++            ent_len = MIN(len, entry->len);
++            if (offset > ent_len) {
++                offset -= ent_len;
++            } else if (offset != 0) {
++                dma_memory_set(qsg->as, entry->base + offset,
++                               pattern, ent_len - offset, MEMTXATTRS_UNSPECIFIED);
++                offset = 0;
++            } else {
++                dma_memory_set(qsg->as, entry->base, pattern, ent_len, MEMTXATTRS_UNSPECIFIED);
++            }
++            entry++;
++        }
++    }
++}
++#endif
++
+ static void nvme_rw_cb(void *opaque, int ret)
+ {
+     NvmeRequest *req = opaque;
+@@ -2177,6 +2336,33 @@ static void nvme_rw_cb(void *opaque, int ret)
+ 
+     trace_pci_nvme_rw_cb(nvme_cid(req), blk_name(blk));
+ 
++#ifdef SEF_CORE
++    if (ns->sef) {
++        sefAIOCB *aiocb = (sefAIOCB *) req->aiocb;
++
++        assert(aiocb);
++        assert(aiocb->common.refcnt == 1);
++        if (aiocb->iov) {
++            int i;
++
++            for (i = 0; i < aiocb->iovcnt; i++) {
++                dma_memory_unmap(req->sg.qsg.as, aiocb->iov[i].iov_base,
++                                aiocb->iov[i].iov_len,
++                                aiocb->read ? DMA_DIRECTION_FROM_DEVICE
++                                            : DMA_DIRECTION_TO_DEVICE,
++                                aiocb->iov[i].iov_len);
++            }
++            g_free(aiocb->iov);
++        }
++        aiocb->iov = 0;
++        if (!ret && aiocb->fill) {
++            nvme_fill_data(&req->sg.qsg, aiocb->fill_off, 0);
++        }
++
++        qemu_aio_unref(aiocb);
++    }
++#endif
++
+     if (ret) {
+         goto out;
+     }
+@@ -2218,6 +2404,32 @@ out:
+     nvme_rw_complete_cb(req, ret);
+ }
+ 
++#ifdef SEF_CORE
++static void nvme_rw_cb_bh(void *opaque)
++{
++    NvmeRequest *req = opaque;
++    NvmeNamespace *ns = req->ns;
++    sefAIOCB *aiocb = (sefAIOCB *) req->aiocb;
++
++    assert( ns->sef );
++    qemu_bh_delete(aiocb->bh);
++    nvme_rw_cb(req, aiocb->ret);
++}
++
++// used to move from SEF library CB to aioContext thread
++static void nvme_rw_cb_th(void *opaque, int ret)
++{
++    NvmeRequest *req = opaque;
++    NvmeNamespace *ns = req->ns;
++    sefAIOCB *aiocb = (sefAIOCB *) req->aiocb;
++
++    assert( ns->sef );
++    aiocb->ret = ret;
++    aiocb->bh = aio_bh_new(aiocb->aioCtx, nvme_rw_cb_bh, req);
++    qemu_bh_schedule(aiocb->bh);
++}
++#endif
++
+ static void nvme_verify_cb(void *opaque, int ret)
+ {
+     NvmeBounceContext *ctx = opaque;
+@@ -2624,7 +2836,25 @@ static uint16_t nvme_dsm(NvmeCtrl *n, NvmeRequest *req)
+ 
+             return status;
+         }
++#ifdef SEF_CORE
++        if (req->ns && req->ns->sef) {
++            sefContext *sc = req->ns->sef_context;
++            uint32_t i;
+ 
++            if (sc->type == kSefBlk) {
++                for(i = 0 ; i < nr ; i++) {
++                    SEFBlockTrim( sc->bc.context,
++                        le64_to_cpu(iocb->range[i].slba),
++                        le32_to_cpu(iocb->range[i].nlb));
++                }
++            } else {
++                status = NVME_INVALID_FIELD;    // does zns even support dsm?
++            }
++            g_free(iocb->range);
++            qemu_aio_unref(iocb);
++            return status;
++        }
++#endif
+         req->aiocb = &iocb->common;
+         nvme_dsm_cb(iocb, 0);
+ 
+@@ -3361,6 +3591,33 @@ static uint16_t nvme_flush(NvmeCtrl *n, NvmeRequest *req)
+             goto out;
+         }
+ 
++#ifdef SEF_CORE
++#if 1   // req->ns (but iocb->ns may not be) can be null which breaks every thing - ignore flush
++        if (iocb->ns && iocb->ns->sef) {
++            return NVME_SUCCESS;
++        }
++#else
++        if (req->ns->sef) {
++            sefAIOCB *sefaiocb;
++            sefContext *sc = req->ns->sef_context;
++
++            sefaiocb = qemu_aio_get(&sef_aiocb_info, NULL, nvme_rw_cb, req);
++            assert(sefaiocb != 0);
++            sefaiocb->read = 0;
++            sefaiocb->zns = (sc->type == kSefZns);
++            sefaiocb->bytes = 0;
++            sefaiocb->iov = 0;
++            sefaiocb->iovcnt = 0;
++            sefaiocb->sig = 0xDEADDEADDEADDEAD;
++
++            req->aiocb = &sefaiocb->common;
++
++            nvme_rw_cb(req, 0);
++            return NVME_NO_COMPLETE;
++        }
++#endif
++#endif
++
+         iocb->nsid = nsid;
+     }
+ 
+@@ -3375,6 +3632,328 @@ out:
+     return status;
+ }
+ 
++#ifdef SEF_CORE
++static void sefZnsWriteDone(struct SEFCommonIOCB *common)
++{
++    struct SEFWriteWithoutPhysicalAddressIOCB *iocb = (void *) common;
++
++    NvmeRequest *req = (NvmeRequest *) iocb->common.param1;
++    NvmeNamespace *ns = req->ns;
++    sefContext *sc = ns->sef_context;
++    uint32_t zoneNumber = SEFGetUserAddressLba(iocb->userAddress) / sc->zc.zs;
++
++    if (qatomic_dec_fetch(&sc->zc.zi[zoneNumber].refCnt) == 0) {
++        closeSuperBlock(ns, zoneNumber, true);
++    }
++    if (iocb->common.status.error) {
++        warn_report("SEF write failed, error:%d, info:%d",
++                    iocb->common.status.error, iocb->common.status.info);
++    }
++    req->cqe.result = iocb->common.status.error;
++    int qd_idx = (SEFGetUserAddressLba(iocb->userAddress) / sc->zc.zs)
++                    % ns->sef_num_domains;
++#if SEF_DIE_STATS
++    {
++        DieStatsWrite(sc->zc.dieStats[qd_idx],
++                     sc->zc.dieList[qd_idx],
++        iocb->tentativeAddresses, iocb->numADU);
++    }
++#endif
++    g_free(iocb->tentativeAddresses);
++
++    assert(req->aiocb->refcnt);
++    nvme_rw_cb_th(req, req->cqe.result);
++
++    sc->zc.isDirty[qd_idx] = true;
++}
++
++static void sefZnsReadDone(struct SEFCommonIOCB *common)
++{
++    struct SEFReadWithPhysicalAddressIOCB *iocb = (void *) common;
++    NvmeRequest *req = (NvmeRequest *) iocb->common.param1;
++
++    if (iocb->common.status.error) {
++        warn_report("SEF read failed, error:%d, info:%d",
++                    iocb->common.status.error, iocb->common.status.info);
++    }
++    req->cqe.result = iocb->common.status.error;
++#if SEF_DIE_STATS
++    {NvmeNamespace *ns = req->ns;
++    sefContext *sc = ns->sef_context;
++    int qd_idx = (SEFGetUserAddressLba(iocb->userAddress) / sc->zc.zs)
++                % ns->sef_num_domains;
++    DieStatsRead(sc->zc.dieStats[qd_idx],
++                sc->zc.dieList[qd_idx],
++        iocb->flashAddress, iocb->numADU); }
++#endif
++
++    assert(req->aiocb->refcnt);
++    nvme_rw_cb_th(req, req->cqe.result);
++}
++
++static void sefBlockDone(struct SEFMultiContext *iocb)
++{
++    NvmeRequest *req = (NvmeRequest *) iocb->arg;
++
++    if (iocb->error) {
++        warn_report("SEF block %s done, error:%d",
++                    iocb->ioType ? "write" : "read", iocb->error);
++    }
++    req->cqe.result = iocb->error;
++    assert(req->aiocb->refcnt);
++    nvme_rw_cb_th(req, req->cqe.result);
++}
++
++static int sef_zns_rw(NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req) {
++    sefAIOCB *aiocb;
++    NvmeRwCmd *rw = (NvmeRwCmd *) cmd;
++    uint32_t nlb  = le32_to_cpu(rw->nlb) + 1;
++    int is_write = (rw->opcode == NVME_CMD_WRITE) ||
++                   (rw->opcode == NVME_CMD_ZONE_APPEND);
++    NvmeZone *zone = nvme_get_zone_by_slba(ns, le64_to_cpu(rw->slba));
++    uint64_t slba = is_write ? zone->d.wp : le64_to_cpu(rw->slba);
++    int i;
++    uint8_t lba_index  = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
++    uint8_t data_shift = ns->id_ns.lbaf[lba_index].ds;
++    uint64_t data_size = (uint64_t)nlb << data_shift;
++    sefContext *sc = ns->sef_context;
++    uint64_t zone_idx = slba / sc->zc.zs;
++    uint64_t zoneOffset = slba % sc->zc.zs;
++    int qd_idx = zone_idx % ns->sef_num_domains;
++
++    assert(zone_idx < ns->num_zones);
++    assert(!is_write || zoneOffset < sc->vd_info.superBlockCapacity);
++    assert(req->sg.qsg.nsg);
++
++    if (!is_write && zoneOffset+nlb >= sc->vd_info.superBlockCapacity) {
++        return NVME_DULB;
++    }
++    aiocb = qemu_aio_get(&sef_aiocb_info, NULL, nvme_rw_cb_th, req);
++    assert(aiocb != 0);
++
++    aiocb->read = !is_write;
++    aiocb->zns = 1;
++    aiocb->bytes = data_size;
++    aiocb->iov = g_malloc0(req->sg.qsg.nsg * sizeof(struct iovec));
++    assert(aiocb->iov);
++
++    aiocb->iovcnt = req->sg.qsg.nsg;
++    aiocb->aioCtx = qemu_get_current_aio_context();
++
++    for (i = 0; i < aiocb->iovcnt; i++) {
++        dma_addr_t cur_addr = req->sg.qsg.sg[i].base;
++        dma_addr_t cur_len = req->sg.qsg.sg[i].len;
++
++        aiocb->iov[i].iov_base = dma_memory_map(req->sg.qsg.as, cur_addr, &cur_len,
++                   aiocb->read ? DMA_DIRECTION_FROM_DEVICE
++                               : DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
++        aiocb->iov[i].iov_len = cur_len;
++        assert(aiocb->iov[i].iov_base);
++        assert(cur_len == req->sg.qsg.sg[i].len);
++    }
++    aiocb->sig = 0xFECEFECEFECEFECE;
++    aiocb->fill = false;
++    aiocb->fill_off = 0;
++
++    req->sg.flags |= NVME_SG_DMA;
++    req->aiocb = &aiocb->common;
++
++    block_acct_start(blk_get_stats(ns->blkconf.blk), &req->acct, 0,
++                     is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ);
++
++    if (!is_write) {
++        if (ns->params.zoned && ns->sef) {
++            // struct sefContext *sc = ns->sef_context;
++            uint64_t wp = zone->d.wp;
++            // /* d.wp set to EOZ when set full so WP is saved */
++            // if (nvme_get_zone_state(zone) == NVME_ZONE_STATE_FULL)
++            //     wp = sc->zc.zi[zone_idx].wp_at_close?:wp;   // if set, use it
++            if (slba + nlb > wp) { /* i/o past end */
++                aiocb->fill = true;
++                if (slba >= wp) {
++                    aiocb->fill_off = nlb = 0;
++                } else {
++                    nlb = (wp - slba);
++                    aiocb->fill_off = (nlb << data_shift);
++                }
++            }
++        }
++
++        aiocb->handle = sc->zc.qos_handle[qd_idx];
++        memset(&aiocb->readIocb, 0, sizeof(aiocb->readIocb));
++        aiocb->readIocb.common.param1 = req;
++        aiocb->readIocb.iov = aiocb->iov;
++        aiocb->readIocb.iovOffset = 0;
++        aiocb->aioCtx = qemu_get_current_aio_context();
++        aiocb->readIocb.common.complete_func = sefZnsReadDone;
++        aiocb->readIocb.flashAddress.bits =
++                        sc->zc.zi[zone_idx].flashAddress.bits + zoneOffset;
++        aiocb->readIocb.userAddress = SEFCreateUserAddress(slba, SEF_ZNS_META_TAG);
++        aiocb->readIocb.numADU = nlb;
++        aiocb->readIocb.iovcnt = aiocb->iovcnt;
++        if (!sc->zc.zi[zone_idx].flashAddress.bits || !nlb) {
++            aiocb->readIocb.common.flags |= kSefIoFlagDone;
++            sefZnsReadDone(&aiocb->readIocb.common);
++        } else {
++            SEFReadWithPhysicalAddressAsync(aiocb->handle, &aiocb->readIocb);
++        }
++    } else {
++        if (!sc->zc.zi[zone_idx].flashAddress.bits) {
++            openSuperBlock(ns, zone_idx);
++        }
++        /*
++         * code marks sb as full after the last write has been sumbitted but
++         * likley before it has completed. refCnt to know when i/o is complete
++         * and zone is marked as full
++         */
++        /* not marked as full */
++        assert(qatomic_load_acquire(&sc->zc.zi[zone_idx].refCnt) > 0);
++        qatomic_inc(&sc->zc.zi[zone_idx].refCnt);
++        aiocb->handle = sc->zc.qos_handle[qd_idx];
++        memset(&aiocb->writeIocb, 0, sizeof(aiocb->writeIocb));
++        aiocb->writeIocb.common.param1 = req;
++        aiocb->writeIocb.iov = aiocb->iov;
++        aiocb->aioCtx = qemu_get_current_aio_context();
++        aiocb->writeIocb.common.complete_func = sefZnsWriteDone;
++        aiocb->writeIocb.flashAddress.bits =
++                    sc->zc.zi[zone_idx].flashAddress.bits + zoneOffset;
++        aiocb->writeIocb.userAddress = SEFCreateUserAddress(slba, SEF_ZNS_META_TAG);
++        aiocb->writeIocb.numADU = nlb;
++        aiocb->writeIocb.iovcnt = aiocb->iovcnt;
++        aiocb->writeIocb.tentativeAddresses =
++                    g_new0(struct SEFFlashAddress, nlb);
++        SEFWriteWithoutPhysicalAddressAsync(aiocb->handle, &aiocb->writeIocb);
++    }
++    return 0;
++}
++
++static int sef_blk_rw(NvmeNamespace *ns, NvmeCmd *cmd,
++                      NvmeRequest *req) {
++    sefAIOCB *aiocb;
++    NvmeRwCmd *rw = (NvmeRwCmd *) cmd;
++    uint32_t nlb  = le32_to_cpu(rw->nlb) + 1;
++    int is_write = rw->opcode == NVME_CMD_WRITE;
++    uint64_t slba = rw->slba;
++    int i;
++    uint8_t lba_index  = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
++    uint8_t data_shift = ns->id_ns.lbaf[lba_index].ds;
++    uint64_t data_size = (uint64_t)nlb << data_shift;
++    sefContext *sc = ns->sef_context;
++    struct SEFStatus status;
++    enum BlockAcctType acct = is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ;
++    uint32_t dsmgmt = le32_to_cpu(rw->dsmgmt);
++    uint32_t dscntrl = le32_to_cpu(rw->control);
++    uint16_t directiveID = dsmgmt >> 16;
++    int directiveType = (dscntrl >> 4) & 0xf;
++
++    if (!is_write && (dscntrl & ~NVME_RW_LR)) {
++        block_acct_invalid(blk_get_stats(ns->blkconf.blk), acct);
++        return NVME_INVALID_FIELD | NVME_DNR;
++    }
++    if (is_write) {
++        switch (directiveType) {
++        case 0:
++            if (sc->bc.numQoS > 1) {
++                int qos = ++sc->bc.lastQoS;
++                int plid = sc->bc.lastPlid;
++
++                if (sc->bc.lastQoS == sc->bc.numQoS) {
++                    sc->bc.lastQoS = qos = 0;
++                    sc->bc.lastPlid++;
++                    plid = (sc->bc.lastPlid %= sc->bc.numPlid);
++                }
++
++                directiveID = qos << 8 | plid;
++            } else {
++                directiveID = 0;
++            }
++           break;
++        case 1:
++            printf("directiveType = 1 (Streams)\n");
++            break;
++        case NVME_DIRECTIVE_DATA_PLACEMENT: // 2
++            //printf("directiveType = 2 (Data Placement)\n");
++            if (ns->subsys && ns->subsys->endgrp.fdp.enabled) {
++                //uint32_t dw12 = le32_to_cpu(req->cmd.cdw12);
++                //uint8_t dtype = (dw12 >> 20) & 0xf;
++                uint16_t pid = le16_to_cpu(rw->dspec);
++                uint16_t ph, rg;
++
++                //if (dtype != NVME_DIRECTIVE_DATA_PLACEMENT ||
++                if (!nvme_parse_pid(ns, pid, &ph, &rg)) {
++                    ph = 0;
++                    rg = 0;
++                }
++
++                //directiveID = rg << 8 | ph; //This is the spec
++		// FIO workload will fail following the spec.
++
++                directiveID = ph << 8 | rg; //This is the spec backwards
++		// FIO workload passes with this configuration, rotating through the different reclaim groups.
++
++                //printf("sef_blk_rw: is_write: DTYPE: %d, QOS: %d, PLID: %d\n", dtype, rg, ph);
++            }
++            break;
++        default:
++            block_acct_invalid(blk_get_stats(ns->blkconf.blk), acct);
++        }
++    }
++
++    aiocb = qemu_aio_get(&sef_aiocb_info, NULL, nvme_rw_cb_th, req);
++    assert(aiocb != 0);
++
++    aiocb->read = !is_write;
++    aiocb->zns = 0;
++    aiocb->bytes = data_size;
++    aiocb->iov = g_malloc0(req->sg.qsg.nsg * sizeof(struct iovec));
++    assert(aiocb->iov);
++
++    aiocb->iovcnt = req->sg.qsg.nsg;
++    aiocb->aioCtx = qemu_get_current_aio_context();
++
++    for (i = 0; i < aiocb->iovcnt; i++) {
++        dma_addr_t cur_addr = req->sg.qsg.sg[i].base;
++        dma_addr_t cur_len = req->sg.qsg.sg[i].len;
++
++        aiocb->iov[i].iov_base = dma_memory_map(req->sg.qsg.as, cur_addr, &cur_len,
++                   aiocb->read ? DMA_DIRECTION_FROM_DEVICE
++                               : DMA_DIRECTION_TO_DEVICE, MEMTXATTRS_UNSPECIFIED);
++        aiocb->iov[i].iov_len = cur_len;
++        assert(aiocb->iov[i].iov_base);
++        assert(cur_len == req->sg.qsg.sg[i].len);
++    }
++    aiocb->sig = 0xFECEFECEFECEFECE;
++    aiocb->fill = false;
++
++    req->sg.flags |= NVME_SG_DMA;
++    req->aiocb = &aiocb->common;
++
++    block_acct_start(blk_get_stats(ns->blkconf.blk), &req->acct, 0,
++                     is_write ? BLOCK_ACCT_WRITE : BLOCK_ACCT_READ);
++
++    aiocb->handle = NULL;
++    memset(&aiocb->blockIocb, 0, sizeof(aiocb->blockIocb));
++    aiocb->blockIocb.blockHandle = sc->bc.context;
++    aiocb->blockIocb.ioType = is_write;
++    aiocb->blockIocb.arg = req;
++    aiocb->blockIocb.iov = aiocb->iov;
++    aiocb->blockIocb.iovcnt = aiocb->iovcnt;
++    aiocb->blockIocb.lba = slba;
++    aiocb->blockIocb.lbc = nlb;
++    aiocb->blockIocb.placementID.id = directiveID & 0xf;
++    aiocb->blockIocb.qosIndex = directiveID >> 8;
++    aiocb->aioCtx = qemu_get_current_aio_context();
++    aiocb->blockIocb.completion = sefBlockDone;
++    status = SEFBlockIO(&aiocb->blockIocb);
++    if (status.error) {
++        aiocb->blockIocb.error = status.error;
++        aiocb->blockIocb.completion(&aiocb->blockIocb);
++    }
++    return 0;
++}
++
++#endif
++
+ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
+ {
+     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+@@ -3420,7 +3999,11 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
+         }
+     }
+ 
++#ifdef SEF_CORE
++    if (!ns->sef && NVME_ERR_REC_DULBE(ns->features.err_rec)) {
++#else
+     if (NVME_ERR_REC_DULBE(ns->features.err_rec)) {
++#endif
+         status = nvme_check_dulbe(ns, slba, nlb);
+         if (status) {
+             goto invalid;
+@@ -3438,6 +4021,23 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
+ 
+     data_offset = nvme_l2b(ns, slba);
+ 
++#ifdef SEF_CORE
++    if (ns->sef) {
++        int ret;
++        sefContext *sc = ns->sef_context;
++
++        if (sc->type == kSefZns) {
++            ret = sef_zns_rw(ns, &req->cmd, req);
++        } else {
++            ret = sef_blk_rw(ns, &req->cmd, req);
++        }
++        if (ret) {
++            return ret;
++        }
++        return NVME_NO_COMPLETE;
++    }
++#endif
++
+     block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                      BLOCK_ACCT_READ);
+     nvme_blk_read(blk, data_offset, BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+@@ -3610,8 +4210,30 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
+ 
+         block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                          BLOCK_ACCT_WRITE);
++#ifdef SEF_CORE
++        if (ns->sef) {
++            int ret;
++            sefContext *sc = ns->sef_context;
++
++            if (sc->type == kSefZns) {  // todo: let sef_zns_rw get the cmd frmo req
++                ret = sef_zns_rw(ns, &req->cmd, req);
++            } else {
++                ret = sef_blk_rw(ns, &req->cmd, req);
++            }
++            if (ret) {
++                return ret;
++            }
++            return NVME_NO_COMPLETE;
++        }
++#endif
+         nvme_blk_write(blk, data_offset, BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+     } else {
++#ifdef SEF_CORE
++        if (ns->sef) {
++            error_report("Write zeros not supported");
++            return NVME_INVALID_OPCODE;
++        }
++#endif
+         req->aiocb = blk_aio_pwrite_zeroes(blk, data_offset, data_size,
+                                            BDRV_REQ_MAY_UNMAP, nvme_rw_cb,
+                                            req);
+@@ -3709,6 +4331,14 @@ static uint16_t nvme_finish_zone(NvmeNamespace *ns, NvmeZone *zone,
+     return nvme_zrm_finish(ns, zone);
+ }
+ 
++#ifdef SEF_CORE
++static uint16_t nvme_reset_zone(NvmeNamespace *ns, NvmeZone *zone,
++                                 NvmeZoneState state, NvmeRequest *req)
++{
++    return nvme_zrm_reset(ns, zone);
++}
++#endif
++
+ static uint16_t nvme_offline_zone(NvmeNamespace *ns, NvmeZone *zone,
+                                   NvmeZoneState state, NvmeRequest *req)
+ {
+@@ -3939,7 +4569,10 @@ static void nvme_zone_reset_cb(void *opaque, int ret)
+         }
+ 
+         trace_pci_nvme_zns_zone_reset(zone->d.zslba);
+-
++#ifdef SEF_CORE
++        if (ns->sef)
++          continue;
++#endif
+         iocb->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk,
+                                             nvme_l2b(ns, zone->d.zslba),
+                                             nvme_l2b(ns, ns->zone_size),
+@@ -4053,7 +4686,16 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
+ 
+     case NVME_ZONE_ACTION_RESET:
+         trace_pci_nvme_reset_zone(slba, zone_idx, all);
+-
++#ifdef SEF_CORE
++        if (ns->sef) {
++            if (all) {
++                proc_mask = NVME_PROC_OPENED_ZONES | NVME_PROC_CLOSED_ZONES |
++                            NVME_PROC_FULL_ZONES;
++            }
++            status = nvme_do_zone_op(ns, zone, proc_mask, nvme_reset_zone, req);
++            break;
++        }
++#endif
+         iocb = blk_aio_get(&nvme_zone_reset_aiocb_info, ns->blkconf.blk,
+                            nvme_misc_cb, req);
+ 
+@@ -5169,6 +5811,8 @@ static uint16_t nvme_get_log(NvmeCtrl *n, NvmeRequest *req)
+         return nvme_fdp_stats(n, lspi, len, off, req);
+     case NVME_LOG_FDP_EVENTS:
+         return nvme_fdp_events(n, lspi, len, off, req);
++#ifdef SEF_CORE
++#endif
+     default:
+         trace_pci_nvme_err_invalid_log_page(nvme_cid(req), lid);
+         return NVME_INVALID_FIELD | NVME_DNR;
+@@ -6926,6 +7570,8 @@ static uint16_t nvme_admin_cmd(NvmeCtrl *n, NvmeRequest *req)
+         return nvme_directive_send(n, req);
+     case NVME_ADM_CMD_DIRECTIVE_RECV:
+         return nvme_directive_receive(n, req);
++#ifdef SEF_CORE
++#endif
+     default:
+         assert(false);
+     }
+diff --git a/hw/nvme/meson.build b/hw/nvme/meson.build
+index 3cf40046ee..85ba4c59b9 100644
+--- a/hw/nvme/meson.build
++++ b/hw/nvme/meson.build
+@@ -1 +1,2 @@
+ softmmu_ss.add(when: 'CONFIG_NVME_PCI', if_true: files('ctrl.c', 'dif.c', 'ns.c', 'subsys.c'))
++softmmu_ss.add(when: ['CONFIG_NVME_PCI','CONFIG_SEF', sef], if_true: [sef])
+diff --git a/hw/nvme/ns.c b/hw/nvme/ns.c
+index 547c0b1543..752a5feca0 100644
+--- a/hw/nvme/ns.c
++++ b/hw/nvme/ns.c
+@@ -27,6 +27,16 @@
+ #define MIN_DISCARD_GRANULARITY (4 * KiB)
+ #define NVME_DEFAULT_ZONE_SIZE   (128 * MiB)
+ 
++#ifdef SEF_CORE
++/*
++ * ns->exit() is not always called on shutdown so track open SEF resources
++ * in this array and clean up in nvme_atexit()
++ */
++static ssize_t g_numToCleanup;
++enum {kNelemNumToCleanUp = 24};   /* arbitrary 24 dies max */
++static NvmeNamespace *g_toCleanUp[kNelemNumToCleanUp];
++#endif
++
+ void nvme_ns_init_format(NvmeNamespace *ns)
+ {
+     NvmeIdNs *id_ns = &ns->id_ns;
+@@ -165,7 +175,9 @@ static int nvme_ns_init_blk(NvmeNamespace *ns, Error **errp)
+         ns->blkconf.discard_granularity =
+             MAX(ns->blkconf.logical_block_size, MIN_DISCARD_GRANULARITY);
+     }
+-
++#ifdef SEF_CORE
++    if (!ns->sef)
++#endif
+     ns->size = blk_getlength(ns->blkconf.blk);
+     if (ns->size < 0) {
+         error_setg_errno(errp, -ns->size, "could not get blockdev size");
+@@ -206,6 +218,18 @@ static int nvme_ns_zoned_check_calc_geometry(NvmeNamespace *ns, Error **errp)
+         return -1;
+     }
+ 
++#ifdef SEF_CORE
++    if (ns->sef) {
++        sefContext *sc = ns->sef_context;
++
++        assert(sc->type == kSefZns);
++
++        zone_size = sc->zc.zs * ns->lbasz;
++        zone_cap  = sc->vd_info.superBlockCapacity * ns->lbasz;
++        ns->size = zone_size * sc->zc.nz;
++        ns->id_ns.nsze = cpu_to_le64(ns->size / ns->lbasz);
++    }
++#endif
+     /*
+      * Save the main zone geometry values to avoid
+      * calculating them later again.
+@@ -256,6 +280,21 @@ static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
+         zone->d.wp = start;
+         zone->w_ptr = start;
+         start += zone_size;
++
++#ifdef SEF_CORE
++        sefContext *sc = ns->sef_context;
++        if (sc && !SEFIsNullFlashAddress(sc->zc.zi[i].flashAddress))
++        {
++            // mark the zone as full
++            // note: blkzone will report garbage wptr values--should be showing -1 instead, but it doesn't
++            nvme_set_zone_state(zone, NVME_ZONE_STATE_FULL);
++
++            // sync the internal zone data with persisted data
++            zone->d.wp = sc->zc.zi[i].wp_at_close + zone->d.zslba;
++            sc->zc.zi[i].wp_at_close = zone->d.wp;
++            zone->w_ptr = zone->d.wp;
++        }
++#endif
+     }
+ 
+     ns->zone_size_log2 = 0;
+@@ -614,12 +653,715 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
+     return 0;
+ }
+ 
++#ifdef SEF_CORE
++static void sef_base_unrealize(NvmeNamespace *ns)
++{
++    sefContext *sc = ns->sef_context;
++    struct SEFStatus status;
++
++    status = SEFLibraryCleanup();
++    if (status.error) {
++        error_report("SEFLibraryCleanup() failed %d", status.error);
++    }
++    free(sc);
++    ns->sef_context = NULL;
++}
++
++static sefContext *sef_base_realize(NvmeNamespace *ns)
++{
++    struct SEFStatus status;
++    const struct SEFInfo *sef_info;
++    sefContext *sc;
++    SEFHandle sef_handle;
++    struct SEFQoSDomainID qos;
++    struct SEFQoSDomainInfo qos_info;
++    struct SEFVirtualDeviceInfo vd_info;
++
++    status = SEFLibraryInit();
++    printf("SEFLibraryInit returned %d:%d\n", status.error, status.info);
++    sef_handle = SEFGetHandle(ns->sef_unit);
++    sef_info = SEFGetInformation(sef_handle);
++    if (!sef_info) {
++        error_report("SEFGetInformation(%d) failed", ns->sef_unit);
++        exit(1);
++    }
++    printf("maxdomains = %d\n", sef_info->maxQoSDomains);
++    printf("numBanks = %d\n", sef_info->numBanks);
++    printf("numChannels = %d\n", sef_info->numChannels);
++    printf("numBlocks = %d\n", sef_info->numBlocks);
++    printf("numPages = %d\n", sef_info->numPages);
++    printf("pageSize = %d\n", sef_info->pageSize);
++    printf("ADUsize[0].data = %d\n", sef_info->ADUsize[0].data);
++    printf("ADUsize[0].meta = %d\n", sef_info->ADUsize[0].meta);
++
++    /* get qosdomaininfo... contains virtual device id. */
++    qos.id = ns->sef_qos_domain;
++    status = SEFGetQoSDomainInformation(sef_handle, qos, &qos_info);
++    if (status.error) {
++        error_report("SEFGetQoSDomainInformation(%u) failed - returned %d:%d",
++                         ns->sef_qos_domain, status.error, status.info);
++        exit(1);
++    }
++    status = SEFGetVirtualDeviceInformation(sef_handle,
++                                            qos_info.virtualDeviceID,
++                                            &vd_info, sizeof(vd_info));
++    if (status.error) {
++        error_report(
++            "SEFGetVirtualDeviceInformation(%u) failed - returned %d:%d",
++            qos_info.virtualDeviceID.id, status.error, status.info);
++        exit(1);
++    }
++    printf("virtual device superblock capacity = %u\n",
++            vd_info.superBlockCapacity);
++    printf("qos domain capacity = %ld\n", qos_info.flashCapacity);
++    printf("virtual device pSLC superblock capacity = %u\n",
++            vd_info.pSLCSuperBlockCapacity);
++    printf("qos domain pSLC capacity = %ld\n", qos_info.pSLCFlashCapacity);
++
++    ns->sef_num_domains = ns->sef_num_domains?:sef_info->numBanks*sef_info->numChannels;
++    sc = calloc(1, sizeof(*sc));
++    sc->sef_handle = sef_handle;
++    sc->qos_id = qos;
++    sc->qos_info = qos_info;
++    sc->vd_info = vd_info;
++    return sc;
++}
++
++static void sef_zns_unrealize(NvmeNamespace *ns)
++{
++    int zoneNumber;
++    struct PDLData *zoneData;
++    struct SEFFlashAddress **persistedAddresses;
++    sefContext *sc = ns->sef_context;
++
++    // create zone data for each domain's zones
++    zoneData = calloc(ns->sef_num_domains, sizeof(struct PDLData));
++
++    // create persistence info for each domain's addresses
++    persistedAddresses = calloc(ns->sef_num_domains, sizeof(struct SEFFlashAddress*));
++
++    // create persistence address info for each domain's zones
++    for (int i = 0; i < ns->sef_num_domains; i++)
++        persistedAddresses[i] = calloc(sc->zc.nzd, sizeof(struct SEFFlashAddress));
++
++    for (zoneNumber = 0; zoneNumber < sc->zc.nz; zoneNumber++)
++    {
++        // create persisted flash address
++        int qd_idx = zoneNumber % ns->sef_num_domains;
++        int domainZone = zoneNumber / ns->sef_num_domains;
++        persistedAddresses[qd_idx][domainZone] = SEFNullFlashAddress;
++        if (!SEFIsNullFlashAddress(sc->zc.zi[zoneNumber].flashAddress))
++        {
++            uint32_t blockNumber;
++            uint32_t aduOffset = ns->zone_array[zoneNumber].d.wp - ns->zone_array[zoneNumber].d.zslba;
++            struct SEFQoSDomainID qid = {qd_idx + ns->sef_qos_domain};
++
++            SEFParseFlashAddress(sc->zc.qos_handle[qd_idx], sc->zc.zi[zoneNumber].flashAddress, NULL, &blockNumber, NULL);
++
++            persistedAddresses[qd_idx][domainZone] = SEFCreateFlashAddress(sc->zc.qos_handle[qd_idx], qid, blockNumber, aduOffset);
++        }
++
++        // close open superblock
++        if (sc->zc.zi[zoneNumber].open)
++        {
++            assert(qatomic_load_acquire(&sc->zc.zi[zoneNumber].refCnt) == 1);
++            qatomic_store_release(&sc->zc.zi[zoneNumber].refCnt, 0);
++            closeSuperBlock(ns, zoneNumber, false);
++        }
++    }
++
++    // persist zone data for each domain
++    for (int qd_idx = 0; qd_idx < ns->sef_num_domains; qd_idx++)
++    {
++        zoneData[qd_idx].Key = (struct PDLKey) { .Name = "ZonedData", .Index = 0 };
++        zoneData[qd_idx].Obj = persistedAddresses[qd_idx];
++        zoneData[qd_idx].ObjSize = sc->zc.nzd * sizeof(struct SEFFlashAddress);
++        zoneData[qd_idx].EncodingType = 0;
++        zoneData[qd_idx].FlushCompleteFunc = NULL;
++        PDLQueueData(sc->zc.pdlHandle[qd_idx], &zoneData[qd_idx]);
++
++        if (sc->zc.isDirty[qd_idx])
++        {
++            struct SEFStatus status;
++
++            PDLFreeFlash(sc->zc.pdlHandle[qd_idx]);
++            status = PDLFlushToFlash(sc->zc.pdlHandle[qd_idx]);
++            if (status.error)
++                error_report("Was unable to persist zone metadata");
++        }
++        else
++        {
++            struct SEFStatus status;
++
++            status = PDLMarkClean(sc->zc.pdlHandle[qd_idx]);
++            if (status.error)
++                error_report("Was unable to mark persisted metadata as clean");
++        }
++
++        PDLCleanup(sc->zc.pdlHandle[qd_idx]);
++        free(persistedAddresses[qd_idx]);
++    }
++
++    free(persistedAddresses);
++    free(sc->zc.zi);
++#if SEF_DIE_STATS
++    sc->zc.zi = NULL;
++    for (int i = 0 ; i < ns->sef_num_domains ; i++) {
++        DieStatsCleanup(sc->zc.dieStats[i]);
++        INSCleanup(&sc->zc.hInst[i]);
++        free(sc->zc.dieList[i]);
++    }
++    free(sc->zc.dieList);
++    free(sc->zc.dieStats);
++    free(sc->zc.hInst);
++#endif
++    for (int i = 0 ; i < ns->sef_num_domains ; i++) {
++        if (sc->zc.qos_handle[i]) {
++            struct SEFStatus status = SEFCloseQoSDomain(sc->zc.qos_handle[i]);
++            if (status.error) {
++                error_report("SEFCloseQoSDomain() failed %d", status.error);
++            }
++        }
++    }
++    free(sc->zc.qos_handle);
++    free(sc->zc.pdlHandle);
++    free(sc->zc.isDirty);
++    free(zoneData);
++    sc->zc.qos_handle = NULL;
++    sef_base_unrealize(ns);
++}
++
++static int sef_zns_repair(sefContext *sc, int metaDataSize, int repair, int qd_idx)
++{
++    int i = 0, numSuperBlocks, metaDataIndex = 0;
++    struct SEFStatus status;
++    struct SEFSuperBlockList *superBlockList;
++    struct SEFFlashAddress *metaDataAddresses;
++
++    // get superblock records
++    numSuperBlocks = 0;
++    superBlockList = NULL;
++    do
++    {
++        if (superBlockList != NULL)
++        {
++            numSuperBlocks = superBlockList->numSuperBlocks;
++            free(superBlockList);
++        }
++
++        int superBlockListSize = numSuperBlocks * sizeof(struct SEFSuperBlockRecord) + sizeof(struct SEFSuperBlockList);
++        superBlockList = malloc(superBlockListSize);
++
++        status = SEFGetSuperBlockList(sc->zc.qos_handle[qd_idx], superBlockList, superBlockListSize);
++        if (status.error)
++        {
++            free(superBlockList);
++            printf("Error: Was unable to get list of the SuperBlocks owned by the QoS Domain\n");
++
++            return status.error;
++        }
++
++    } while (superBlockList->numSuperBlocks != numSuperBlocks);
++
++    if (repair)
++        metaDataAddresses = malloc(metaDataSize * sizeof(struct SEFFlashAddress));
++
++    // get user address list
++    for (i = 0; i < superBlockList->numSuperBlocks; i++)
++    {
++        int userAddressListSize;
++        uint64_t persistedMeta;
++        struct SEFUserAddressList *userAddressList = NULL;
++        zoneInfo* info;
++        struct SEFSuperBlockInfo superBlockInfo;
++
++        status = SEFGetSuperBlockInfo(sc->zc.qos_handle[qd_idx],
++            superBlockList->superBlockRecords[i].flashAddress, 0, &superBlockInfo);
++        if (!status.error)
++        {
++            userAddressListSize = sizeof(*userAddressList) +
++                sizeof(userAddressList->userAddressesRecovery[0]) *
++                superBlockInfo.writableADUs;
++            userAddressList = malloc(userAddressListSize);
++            status = SEFGetUserAddressList(sc->zc.qos_handle[qd_idx],
++                superBlockInfo.flashAddress, userAddressList, userAddressListSize);
++        }
++        if (status.error)
++        {
++            printf("Error: Was unable to get superblock's user addresses\n");
++            free(superBlockList);
++            free(userAddressList);
++            if (repair)
++                free(metaDataAddresses);
++
++            return status.error;
++        }
++
++        persistedMeta = SEFGetUserAddressMeta(userAddressList->userAddressesRecovery[0]);
++        if (persistedMeta != SEF_ZNS_META_TAG) // skip persistence's metadata
++        {
++            uint32_t aduOffset;
++            uint64_t slba, zone;
++
++            slba = SEFGetUserAddressLba(userAddressList->userAddressesRecovery[0]);
++            zone = slba / sc->zc.zs;
++
++            info = &sc->zc.zi[zone];
++
++            if (!repair && !SEFIsEqualFlashAddress(info->flashAddress, superBlockList->superBlockRecords[i].flashAddress))
++            {
++                free(superBlockList);
++                free(userAddressList);
++                return -1;
++            }
++
++            info->flashAddress = superBlockList->superBlockRecords[i].flashAddress;
++
++            aduOffset = 0;
++            while (aduOffset < userAddressList->numADUs)
++            {
++                if (SEFGetUserAddressMeta(userAddressList->userAddressesRecovery[aduOffset]) != 0)
++                    break;
++
++                aduOffset++;
++            }
++
++            if (!repair && aduOffset != info->wp_at_close)
++            {
++                free(superBlockList);
++                free(userAddressList);
++                return -1;
++            }
++
++            info->wp_at_close = aduOffset;
++        }
++        else if (repair)
++        {
++            metaDataAddresses[metaDataIndex] = superBlockList->superBlockRecords[i].flashAddress;
++            metaDataIndex++;
++
++            // return error if out of bounds
++            if (metaDataIndex >= metaDataSize)
++            {
++                free(superBlockList);
++                free(userAddressList);
++                free(metaDataAddresses);
++                return -1;
++            }
++        }
++
++        free(userAddressList);
++    }
++
++    if (repair)
++    {
++        sc->zc.isDirty[qd_idx] = true;
++
++        // free metadata superblocks
++        for (i = 0; i < metaDataIndex; i++)
++        {
++            status = SEFReleaseSuperBlock(sc->zc.qos_handle[qd_idx], metaDataAddresses[i]);
++            if (status.error)
++            {
++                printf("Error: Was unable to release the metadata superblock\n");
++                free(superBlockList);
++                free(metaDataAddresses);
++
++                return status.error;
++            }
++        }
++
++        printf("The persisted Zone MetaData was fixed\n");
++        free(metaDataAddresses);
++    }
++
++    free(superBlockList);
++
++    return 0;
++}
++
++// check that capacities for an additional domain and its virtual device meet requirements of the first domain in sc
++static void sef_zns_confirm_domain_cap(sefContext *sc, struct SEFQoSDomainID qid, struct SEFQoSDomainInfo *qi)
++{
++    struct SEFStatus status;
++    struct SEFVirtualDeviceInfo vi = {0};
++    bool pSLC = sc->zc.pSLC;
++
++    status = SEFGetQoSDomainInformation(sc->sef_handle, qid, qi);
++    if (status.error) {
++        error_report("SEFGetQoSDomainInformation(%u) failed %d:%d", qid.id,
++                    status.error, status.info);
++        exit(1);
++    }
++    if (!pSLC && qi->flashCapacity < sc->qos_info.flashCapacity) {
++        error_report(
++            "QoS capacity for %u of %lu is less than base capacity",
++            qid.id, qi->flashCapacity);
++        exit(1);
++    }
++    else if (pSLC && qi->pSLCFlashCapacity < sc->qos_info.pSLCFlashCapacity) {
++        error_report(
++            "QoS pSLC capacity for %u of %lu is less than base capacity",
++            qid.id, qi->pSLCFlashCapacity);
++        exit(1);
++    }
++    status = SEFGetVirtualDeviceInformation(sc->sef_handle,
++                                            qi->virtualDeviceID,
++                                            &vi, sizeof(vi));
++    if (status.error) {
++        error_report("SEFGetVirtualDeviceInformation(%u) failed %d:%d",
++                    qid.id, status.error, status.info);
++        exit(1);
++    }
++    if (!pSLC && vi.superBlockCapacity != sc->vd_info.superBlockCapacity) {
++        printf("VD sb capacity for %u of %u does not equal base sb size\n",
++        qi->virtualDeviceID.id, vi.superBlockCapacity);
++    }
++    else if (pSLC && vi.pSLCSuperBlockCapacity != sc->vd_info.pSLCSuperBlockCapacity) {
++        printf("VD pslc sb capacity for %u of %u does not equal base pslc sb size\n",
++        qi->virtualDeviceID.id, vi.pSLCSuperBlockCapacity);
++    }
++}
++
++// retrieve stored addresses for one domain's zones
++static int sef_zns_get_persisted_addresses(NvmeNamespace *ns, sefContext *sc, int qd_idx)
++{
++    struct SEFStatus status;
++    struct PDLData data;
++    struct SEFQoSDomainID qid = {qd_idx + ns->sef_qos_domain};
++    struct PDLKey key = { .Name = "ZonedData", .Index = 0 };
++    //key.Name = (char *)"ZonedData";
++
++    status = PDLReadFlash(sc->zc.pdlHandle[qd_idx], key, &data);
++    if (!status.error)
++    {
++        int zoneNumber, domainZone;
++        uint32_t blockNumber;
++        uint32_t aduOffset;
++        struct SEFFlashAddress *persistedAddresses = data.Obj;
++
++        // restore flash addresses for all of the domain's zones
++        for (domainZone = 0; domainZone < sc->zc.nzd; domainZone++)
++        {
++            zoneNumber = qd_idx + (domainZone * ns->sef_num_domains);
++            if (!SEFIsNullFlashAddress(persistedAddresses[domainZone]))
++            {
++                // restore the zone's flash address
++                SEFParseFlashAddress(sc->zc.qos_handle[qd_idx], persistedAddresses[domainZone], NULL, &blockNumber, &aduOffset);
++                sc->zc.zi[zoneNumber].flashAddress = SEFCreateFlashAddress(sc->zc.qos_handle[qd_idx], qid, blockNumber, 0);
++
++                // restore wp at close as aduOffset
++                sc->zc.zi[zoneNumber].wp_at_close = aduOffset;
++            }
++        }
++        free(data.Obj);
++    }
++    else if (status.error && status.error != -ENOENT)
++    {
++        return 1;
++    }
++    return 0;
++}
++
++static sefContext *sef_zns_realize(NvmeNamespace *ns)
++{
++    sefContext *sc;
++    uint64_t flashCapacity;
++    uint32_t metaDataSize;
++    uint32_t superBlockCapacity;
++    struct SEFStatus status;
++    struct PDLGuid znsGuid = SEFZnsGUID;
++
++    bool needRepair;
++    bool pSLC;
++
++    // sef backing doesn't support "Read Across Zone Boundaries"
++    if (ns->params.cross_zone_read) {
++        error_report("sef=true can't be used zoned.cross_read");
++        exit(1);
++    }
++    ns->blkconf.physical_block_size = 4096;
++    ns->blkconf.logical_block_size = 4096;
++    sc = sef_base_realize(ns);
++    if (!sc) {
++        return sc;
++    }
++    sc->type = kSefZns;
++
++    // flash quota determines whether pSLC will be used
++    sc->zc.pSLC = pSLC = sc->qos_info.pSLCFlashQuota > sc->qos_info.flashQuota;
++    superBlockCapacity = pSLC ? sc->vd_info.pSLCSuperBlockCapacity :
++                    sc->vd_info.superBlockCapacity;
++    flashCapacity = pSLC ? sc->qos_info.pSLCFlashCapacity :
++                    sc->qos_info.flashCapacity;
++
++    /* round up to the next power of 2 - clp2() */
++    sc->zc.zs = 1 << (32 - __builtin_clz(superBlockCapacity - 1));
++    sc->zc.nz = (flashCapacity * ns->sef_num_domains)
++                / superBlockCapacity;
++    sc->zc.nzd = DIV_ROUND_UP(sc->zc.nz, ns->sef_num_domains);
++
++    // room for persistence on each domain
++    metaDataSize = (sc->zc.nzd * sizeof(struct SEFFlashAddress) + superBlockCapacity - 1)
++                    / superBlockCapacity;
++    sc->zc.nz -= metaDataSize * ns->sef_num_domains;
++    sc->zc.nzd = DIV_ROUND_UP(sc->zc.nz, ns->sef_num_domains);
++
++    printf("max zone capacity = %u\n", superBlockCapacity);
++    printf("zone size = %u\n", sc->zc.zs);
++    printf("number of zones = %d\n", sc->zc.nz);
++    printf("max open super blocks = %u\n", sc->qos_info.maxOpenSuperBlocks);
++    printf("using pSLC = %u\n", pSLC);
++
++    // limit max open zones to one domain's max open super block limit
++    ns->params.max_open_zones = (sc->qos_info.maxOpenSuperBlocks < sc->zc.nz) ?
++        sc->qos_info.maxOpenSuperBlocks : sc->zc.nz;
++    ns->params.max_active_zones = (sc->qos_info.maxOpenSuperBlocks < sc->zc.nz) ?
++        sc->qos_info.maxOpenSuperBlocks : sc->zc.nz;
++
++    sc->zc.zi = calloc(sc->zc.nz, sizeof(*sc->zc.zi));
++    sc->zc.qos_handle = calloc(ns->sef_num_domains, sizeof(*sc->zc.qos_handle));
++    sc->zc.pdlHandle = calloc(ns->sef_num_domains, sizeof(*sc->zc.pdlHandle));
++    sc->zc.isDirty = calloc(ns->sef_num_domains, sizeof(*sc->zc.isDirty));
++
++    // open each domain
++    for (int qd_idx = 0; qd_idx < ns->sef_num_domains; qd_idx++)
++    {
++        struct SEFQoSDomainID qid = {qd_idx + ns->sef_qos_domain};
++        struct SEFQoSDomainInfo qi = {0};
++        struct QoSState qosState;
++
++        status = SEFOpenQoSDomain(sc->sef_handle, qid, NULL, sc, NULL,
++                                  &sc->zc.qos_handle[qd_idx]);
++        if (status.error) {
++            printf("SEFOpenQoSDomain returned %d:%d\n", status.error, status.info);
++            exit(1);
++        }
++
++        if (qd_idx > 0) // confirm capacity requirements set by first are met
++            sef_zns_confirm_domain_cap(sc, qid, &qi);
++        else // use info from first domain otherwise
++            qi = sc->qos_info;
++
++        // load persisted metadata or attempt to recover it
++        needRepair = false;
++        qosState.numDomains = 1;
++        qosState.qosDomainIds = &qid;
++        qosState.qosDomainHandles = &sc->zc.qos_handle[qd_idx];
++        status = PDLInit(&sc->zc.pdlHandle[qd_idx], sc->sef_handle, &qosState, &qi, znsGuid);
++        if (status.error == -ENOEXEC) 
++            needRepair = true;
++
++        if (PDLIsDirty(sc->zc.pdlHandle[qd_idx]).info)
++            needRepair = true;
++
++        if (!needRepair)
++            needRepair = sef_zns_get_persisted_addresses(ns, sc, qd_idx);
++
++        if (needRepair)
++        {
++            printf("Error: Couldn't recover the persisted zone metadata for domain %d; attempting recovery\n", qd_idx);
++
++            if (sef_zns_repair(sc, metaDataSize, 1, qd_idx))
++            {
++                printf("Error: Attempted recovery failed\n");
++                exit(1);
++            }
++        }
++
++        // mark persisted metadata as dirty
++        status = PDLMarkDirty(sc->zc.pdlHandle[qd_idx]);
++        if (status.error)
++        {
++            printf("Error: Could not mark persisted metadata as dirty\n");
++            exit(1);
++        }
++    }
++#if SEF_DIE_STATS
++    sc->zc.hInst = calloc(ns->sef_num_domains, sizeof(INSHandle));
++    sc->zc.dieStats = calloc(ns->sef_num_domains, sizeof(DieStatsHandle));
++    sc->zc.dieList = calloc(ns->sef_num_domains, sizeof(struct SEFDieList*));
++    for (int i = 0 ; i < ns->sef_num_domains ; i++) {
++        int ret;
++        struct SEFQoSDomainInfo qi = {0};
++        struct SEFQoSDomainID qid = {i + ns->sef_qos_domain};
++        struct SEFStatus status;
++        char socketPath[40];
++        snprintf(socketPath, 40, "/tmp/SEFFTLDomain.%u.%u", ns->sef_unit, qid.id);
++        ret = INSInit(socketPath, &sc->zc.hInst[i], NULL);
++        if (ret) {
++            error_report("INSInit failed %d", ret);
++            exit(1);
++        }
++        ret = DieStatsInit(sc->zc.qos_handle[i], 4096, sc->zc.hInst[i],
++                           (struct DieStats **)&sc->zc.dieStats[i], NULL);
++        if (ret) {
++            error_report("DieStatsInit failed %d", ret);
++            exit(1);
++        }
++        status = SEFGetQoSDomainInformation(sc->sef_handle, qid, &qi);
++        if (status.error) {
++            error_report("SEFGetQoSDomainInformation(%u) failed %d:%d",
++                         qid.id, status.error, status.info);
++            exit(1);
++        }
++        // get appropriately sized die list
++        int req_n = 0;
++        int ret_n = 0;
++        do
++        {
++            int size = sizeof(*sc->zc.dieList[i]) + sizeof(*sc->zc.dieList[i]->dieIDs) * ret_n;
++            req_n = ret_n;
++            if (sc->zc.dieList[i])
++                free(sc->zc.dieList[i]);
++            sc->zc.dieList[i] = malloc(size);
++            status = SEFGetDieList(sc->sef_handle, qi.virtualDeviceID, sc->zc.dieList[i], size);
++            if (status.error) {
++                error_report("SEFGetDieList(%u) failed %d:%d",
++                        qi.virtualDeviceID.id, status.error, status.info);
++                free(sc->zc.dieList[i]);
++                exit(1);
++            }
++            ret_n = sc->zc.dieList[i]->numDies;
++        } while (ret_n > req_n);
++        //
++        // I don't know why this restriction is here - it breaks old tests.
++        // As best as I can tell, it was added when converted to work with
++        // v1.12 api.
++        //
++        // if (sc->zc.dieList[i]->numDies != 1) {
++        //     error_report("Domain %u's virtual device %u had %u dies instead of 1\n",
++        //         qid.id, qi.virtualDeviceID.id, sc->zc.dieList[i]->numDies);
++        //     exit(1);
++        // }
++    }
++#endif
++    return sc;
++}
++
++static void sef_blk_unrealize(NvmeNamespace *ns)
++{
++    sefContext *sc = ns->sef_context;
++    SEFBlockCleanup(&sc->bc.context);
++    sef_base_unrealize(ns);
++}
++
++static sefContext *sef_blk_realize(NvmeNamespace *ns)
++{
++    sefContext *sc;
++    struct SEFStatus status;
++    struct SEFQoSDomainID qid = {ns->sef_qos_domain};
++    struct SEFBlockInfo bi;
++
++#if 0
++    if (ns->sef_num_domains != 1) {
++        printf("sef_num_domains value of %d ignored\n", ns->sef_num_domains);
++        ns->sef_num_domains = 1;
++    }
++#endif
++    ns->blkconf.physical_block_size = 4096;
++    ns->blkconf.logical_block_size = 4096;
++    sc = sef_base_realize(ns);
++    if (!sc) {
++        return sc;
++    }
++    sc->type = kSefBlk;
++
++    const char *failure_point = "";
++    status = SEFBlockInit(ns->sef_unit, qid, NULL, &sc->bc.context);
++    switch (status.error) {
++        case 0:
++            break;
++        case -ENOENT:
++            status = SEFBlockConfig(ns->sef_unit, qid, NULL);
++            if (status.error == 0)
++                break;
++            failure_point = "(block config)";
++            __attribute__((fallthrough));
++        default:
++            error_report("Failed to initialize sef block layer %d/%d %s",
++                        status.error, status.info, failure_point);
++            exit(1);
++    }
++
++    SEFBlockGetInfo(sc->bc.context, &bi);
++
++    ns->size = bi.capacity << 12; // 4096
++    sc->bc.numQoS = bi.numDomains;
++    sc->bc.numPlid = MIN(4,bi.numPlacementIDs);
++    sc->bc.lastQoS = bi.numDomains - 1;
++    sc->bc.lastPlid = bi.numPlacementIDs = 1;
++    return sc;
++}
++
++static sefContext *sef_realize(NvmeNamespace *ns)
++{
++    sefContext *sc = NULL;
++#ifdef SEF_SIMULATOR
++    int ret;
++
++    printf("Path to NAND configuration is '%s'\n", ns->sef_sim_path);
++    ret = SEFSimSetDeviceConfig(ns->sef_sim_path);
++    if (ret) {
++        printf("Error processing yaml configuration file\n");
++        return sc;
++    }
++#endif
++
++    if (ns->params.zoned) {
++        sc = sef_zns_realize(ns);
++    } else {
++        sc = sef_blk_realize(ns);
++    }
++
++    if (sc && g_numToCleanup < kNelemNumToCleanUp) {
++        g_toCleanUp[g_numToCleanup++] = ns;
++    }
++    return sc;
++}
++
++static void sef_unrealize(NvmeNamespace *ns)
++{
++    sefContext *sc = ns->sef_context;
++
++    if (!sc) {
++        return;
++    }
++
++    for (int i = 0; i < g_numToCleanup ; i++) {
++        if (ns == g_toCleanUp[i]) {
++            g_toCleanUp[i] = 0;
++        }
++    }
++
++    if (sc->type == kSefZns) {
++        sef_zns_unrealize(ns);
++    } else if (sc->type == kSefBlk) {
++        sef_blk_unrealize(ns);
++    }
++}
++
++static void __attribute__((destructor)) nvme_atexit(void)
++{
++    int i;
++
++    for (i = 0; i < g_numToCleanup ; i++) {
++        sef_unrealize(g_toCleanUp[i]);
++    }
++}
++#endif
++
+ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
+ {
+     if (nvme_ns_check_constraints(ns, errp)) {
+         return -1;
+     }
+ 
++#ifdef SEF_CORE
++    if (ns->sef) {
++        ns->sef_context = sef_realize(ns);
++    }
++#endif
+     if (nvme_ns_init_blk(ns, errp)) {
+         return -1;
+     }
+@@ -792,6 +1534,15 @@ static Property nvme_ns_props[] = {
+     DEFINE_PROP_BOOL("eui64-default", NvmeNamespace, params.eui64_default,
+                      false),
+     DEFINE_PROP_STRING("fdp.ruhs", NvmeNamespace, params.fdp.ruhs),
++#ifdef SEF_CORE
++    DEFINE_PROP_BOOL("sef", NvmeNamespace, sef, false),
++    DEFINE_PROP_UINT16("sef.unit", NvmeNamespace, sef_unit, 0),
++    DEFINE_PROP_UINT16("sef.qos_domain", NvmeNamespace, sef_qos_domain, 1),
++    DEFINE_PROP_UINT16("sef.num_domains", NvmeNamespace, sef_num_domains, 1),
++#ifdef SEF_SIMULATOR
++    DEFINE_PROP_STRING("sef.sim_path", NvmeNamespace, sef_sim_path),
++#endif
++#endif
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/nvme/nvme.h b/hw/nvme/nvme.h
+index 209e8f5b4c..e547d327e7 100644
+--- a/hw/nvme/nvme.h
++++ b/hw/nvme/nvme.h
+@@ -245,6 +245,16 @@ typedef struct NvmeNamespace {
+     struct {
+         uint32_t err_rec;
+     } features;
++#ifdef SEF_CORE
++    void            *sef_context;   // points to a sefContext
++#ifdef SEF_SIMULATOR
++    char            *sef_sim_path;  // option - Passed to SEFSimSetDeviceConfig();
++#endif
++    bool            sef;            // option - use sef for backing, default 0
++    uint16_t        sef_unit;       // option - sef unit #, default 0
++    uint16_t        sef_qos_domain; // option - base qos domain id, default 2
++    uint16_t        sef_num_domains;// option - number of ZNS domains, default 1
++#endif
+ 
+     struct {
+         uint16_t nphs;
+@@ -253,6 +263,146 @@ typedef struct NvmeNamespace {
+     } fdp;
+ } NvmeNamespace;
+ 
++#ifdef SEF_CORE
++#ifndef SEF_DIE_STATS   // currently broken because instrumentation changed
++#define SEF_DIE_STATS 1      /* enables die stats for zns device */
++#endif
++
++#include <SEFAPI.h>
++#ifdef SEF_SIMULATOR
++#include <SEFSim.h>
++#endif
++
++#include <sef-block-module.h>
++
++#if SEF_DIE_STATS
++/* definitions from instrumentation.h and die-stats.h */
++typedef struct INSHandle_ *INSHandle;
++int INSInit(const char *socketPath, INSHandle *ictxt, void *logHandle);
++void INSCleanup(INSHandle *ictxt);
++
++typedef struct DieStats *DieStatsHandle;
++int DieStatsInit(SEFQoSHandle qosHandle, int aduSize, void *hInst,
++                 DieStatsHandle *dieStats_out, void *logHandle);
++void DieStatsCleanup(DieStatsHandle dieStats);
++void DieStatsWrite(DieStatsHandle dieStats, const struct SEFDieList* vdDieList,
++                   struct SEFFlashAddress* flashAddress, ssize_t numAddr);
++void DieStatsRead(DieStatsHandle dieStats, const struct SEFDieList* vdDieList,
++                  struct SEFFlashAddress flashAddress, int numReads);
++#endif
++
++#define SEF_ZNS_META_TAG 0x924835
++
++typedef struct PDLHandle_ *PDLHandle;
++
++struct PDLKey
++{
++    char Name[24];        /**< A name associated with the data */
++    int Index;                  /**< A index associated with the data */
++};
++
++struct PDLData
++{
++    struct PDLKey Key;        /**< A unique key used to identify the data */
++    void *Obj;        /**< Pointer to the data */
++    uint64_t ObjSize; /**< Size of data */
++    int EncodingType; /**< Encoding used to stored the data to the flash memory */
++    void *arg;        /**< A void* pointer passed to the callback function (used to pass user context information) */
++    void (*FlushCompleteFunc)(struct PDLData *,
++                              int isFlushed); /**< Callback function that is called after flush or cleanup */
++};
++struct PDLGuid
++{
++    char data[16];
++};
++typedef struct QoSState
++{
++    int numDomains;
++    struct SEFQoSDomainID lastusedQosDomainId;
++    struct SEFQoSDomainID *qosDomainIds;
++    SEFQoSHandle *qosDomainHandles;
++} *QoSState;
++struct SEFStatus PDLInit(PDLHandle *pdlHandle, SEFHandle sefHandle, QoSState qosState,
++                         struct SEFQoSDomainInfo *qosInfo, struct PDLGuid persistedGUID);
++struct SEFStatus PDLReadFlash(PDLHandle pdlHandle, struct PDLKey key, struct PDLData *data);
++struct SEFStatus PDLQueueData(PDLHandle pdlHandle, struct PDLData *data);
++struct SEFStatus PDLMarkClean(PDLHandle pdlHandle);
++struct SEFStatus PDLMarkDirty(PDLHandle pdlHandle);
++struct SEFStatus PDLFreeFlash(PDLHandle pdlHandle);
++struct SEFStatus PDLFlushToFlash(PDLHandle pdlHandle);
++struct SEFStatus PDLIsDirty(PDLHandle pdlHandle);
++struct SEFStatus PDLCleanup(PDLHandle pdlHandle);
++
++#define SEFZnsGUID { {0xc3, 0x24, 0x8f, 0x22, 0xc1, 0x05, 0xb7, 0xc9, 0x92, 0x58, 0x5b, 0x71, 0x52, 0xaf, 0x41, 0x50} }
++
++typedef struct zoneInfo {
++    struct SEFFlashAddress flashAddress;
++    uint64_t wp_at_close;
++    int refCnt;
++    bool open;
++} zoneInfo;
++
++typedef struct sefZoneContext {
++    zoneInfo        *zi;        /* parallel to nvme's zone info */
++    SEFQoSHandle    *qos_handle;
++    PDLHandle       *pdlHandle;
++    uint32_t        zs;
++    uint32_t        nz;
++    uint32_t        nzd;
++    bool            pSLC;
++    bool            *isDirty;
++#if SEF_DIE_STATS
++    INSHandle       *hInst; /* array of instrumentation handles */
++    DieStatsHandle  *dieStats;
++    struct SEFDieList   **dieList; /* only support 1 die per domain */
++#endif
++} sefZoneContext;
++
++enum sefType {kSefNull, kSefZns, kSefBlk};
++
++typedef struct sefBlockContext {
++    SEFBlockHandle context; /* SEFBlockInit() returned context */
++    uint16_t lastQoS;
++    uint16_t lastPlid;
++    uint16_t numPlid;
++    uint16_t numQoS;
++} sefBlockContext;
++
++/* shared sef context */
++typedef struct sefContext {
++    enum sefType    type;
++    struct SEFQoSDomainID qos_id;
++    SEFHandle       sef_handle;
++    union {
++        sefZoneContext zc;
++        sefBlockContext bc;
++    };
++    struct SEFQoSDomainInfo qos_info;
++    struct SEFVirtualDeviceInfo vd_info;
++} sefContext;
++
++typedef struct {
++    BlockAIOCB common;
++    struct iovec *iov;
++    int iovcnt;
++    uint64_t bytes;
++    char read;
++    char zns;
++    union {
++        struct SEFWriteWithoutPhysicalAddressIOCB writeIocb;
++        struct SEFReadWithPhysicalAddressIOCB readIocb;
++        struct SEFMultiContext blockIocb;
++    };
++    void *handle;
++    AioContext* aioCtx;
++    QEMUBH* bh;
++    int ret;
++    int fill_off;
++    bool fill;
++    uint64_t sig;
++} sefAIOCB;
++#endif
++
+ static inline uint32_t nvme_nsid(NvmeNamespace *ns)
+ {
+     if (ns) {
+@@ -672,4 +822,8 @@ void nvme_rw_complete_cb(void *opaque, int ret);
+ uint16_t nvme_map_dptr(NvmeCtrl *n, NvmeSg *sg, size_t len,
+                        NvmeCmd *cmd);
+ 
++#ifdef SEF_CORE
++void closeSuperBlock(NvmeNamespace *ns, uint32_t zoneNumber, bool async);
++#endif
++
+ #endif /* HW_NVME_NVME_H */
+diff --git a/hw/nvme/subsys.c b/hw/nvme/subsys.c
+index 24ddec860e..e2afbe12a3 100644
+--- a/hw/nvme/subsys.c
++++ b/hw/nvme/subsys.c
+@@ -14,6 +14,13 @@
+ 
+ #define NVME_DEFAULT_RU_SIZE (96 * MiB)
+ 
++#ifdef SEF_SIMULATOR
++#include <SEFAPI.h>
++#include <SEFSim.h>
++#include <sef-block-module.h>
++#endif /* SIMULATOR */
++
++
+ static int nvme_subsys_reserve_cntlids(NvmeCtrl *n, int start, int num)
+ {
+     NvmeSubsystem *subsys = n->subsys;
+@@ -140,6 +147,69 @@ static bool nvme_calc_rgif(uint16_t nruh, uint16_t nrg, uint8_t *rgif)
+     return true;
+ }
+ 
++#ifdef SEF_SIMULATOR
++static int nvme_subsys_sef_nrg(void)
++{
++    // sef-cli info qos -s0 -q1
++    int num_qos = 0;
++
++    SEFHandle sefHandle;
++    const struct SEFInfo *info;
++    struct SEFStatus status;
++
++    status = SEFLibraryInit();
++    if (!status.info)
++    {
++	return -1;
++    }
++
++    sefHandle = SEFGetHandle(0);
++    if (!sefHandle)
++    {
++        return -1;
++    }
++
++    info = SEFGetInformation(sefHandle);
++    if (!info)
++    {
++        return -1;
++    }
++    num_qos = info->numQoSDomains;
++    //printf("numQoSDomains = %d\n", num_qos);
++    return num_qos;
++}
++
++static int nvme_subsys_sef_nruh(void)
++{
++    // sef-cli info sef -s0
++    int num_plid = 0;
++    SEFHandle sefHandle;
++    struct SEFStatus status;
++    struct SEFQoSDomainInfo qosInfo;
++    struct SEFQoSDomainID qd = {.id = 1};
++    status = SEFLibraryInit();
++    if (!status.info)
++    {
++	return -1;
++    }
++
++    sefHandle = SEFGetHandle(0);
++    if (!sefHandle)
++    {
++        return -1;
++    }
++
++    status = SEFGetQoSDomainInformation(sefHandle, qd, &qosInfo);
++    if (status.error)
++    {
++        return -1;
++    }
++    num_plid = qosInfo.numPlacementIDs;
++
++    return num_plid;
++}
++#endif
++
+ static bool nvme_subsys_setup_fdp(NvmeSubsystem *subsys, Error **errp)
+ {
+     NvmeEnduranceGroup *endgrp = &subsys->endgrp;
+@@ -151,19 +221,27 @@ static bool nvme_subsys_setup_fdp(NvmeSubsystem *subsys, Error **errp)
+ 
+     endgrp->fdp.runs = subsys->params.fdp.runs;
+ 
+-    if (!subsys->params.fdp.nrg) {
++#ifdef SEF_SIMULATOR
++    int num_plid = nvme_subsys_sef_nrg();
++    int num_qosd = nvme_subsys_sef_nruh();
++#else
++    int num_plid = 0;
++    int num_qosd = 0;
++#endif
++    printf("TEST vd: %d, qos: %d\n", num_plid, num_qosd);
++    if (!subsys->params.fdp.nrg && !num_qosd) {
+         error_setg(errp, "fdp.nrg must be non-zero");
+         return false;
+     }
+ 
+-    endgrp->fdp.nrg = subsys->params.fdp.nrg;
++    endgrp->fdp.nrg = num_qosd ? num_qosd : subsys->params.fdp.nrg;
+ 
+-    if (!subsys->params.fdp.nruh) {
++    if (!subsys->params.fdp.nruh && !num_plid) {
+         error_setg(errp, "fdp.nruh must be non-zero");
+         return false;
+     }
+ 
+-    endgrp->fdp.nruh = subsys->params.fdp.nruh;
++    endgrp->fdp.nruh = num_plid ? num_plid : subsys->params.fdp.nruh;
+ 
+     if (!nvme_calc_rgif(endgrp->fdp.nruh, endgrp->fdp.nrg, &endgrp->fdp.rgif)) {
+         error_setg(errp,
+diff --git a/hw/nvme/trace-events b/hw/nvme/trace-events
+index 7f7837e1a2..1af6418fa1 100644
+--- a/hw/nvme/trace-events
++++ b/hw/nvme/trace-events
+@@ -215,3 +215,19 @@ pci_nvme_ub_db_wr_invalid_sq(uint32_t qid) "submission queue doorbell write for
+ pci_nvme_ub_db_wr_invalid_sqtail(uint32_t qid, uint16_t new_tail) "submission queue doorbell write value beyond queue size, sqid=%"PRIu32", new_head=%"PRIu16", ignoring"
+ pci_nvme_ub_unknown_css_value(void) "unknown value in cc.css field"
+ pci_nvme_ub_too_many_mappings(void) "too many prp/sgl mappings"
++
++# kic_sef.c
++# kic_sef traces for successful events
++kicsef_map_multi_prp_len(uint64_t trans_len, uint32_t offset, uint32_t org_len, uint32_t total_len, uint32_t len1) "trans_len = 0x%"PRIx64", offset = 0x%"PRIx32", org_len = 0x%"PRIx32", total_len = 0x%"PRIx32", len1 = 0x%"PRIx32""
++kicsef_map_multi_prp_prp(uint64_t prp1, uint64_t prp2, void *n, uint32_t num_prps1) "prp1 = 0x%"PRIx64", prp2 = 0x%"PRIx64", n = %p, num_prps1 = 0x%"PRIu32""
++kicsef_process_page_new_aduptr(int sbid, uint64_t aduptr, uint64_t new_aduptr) "sbid = %d, aduptr = 0x%"PRIx64", new_aduptr = 0x%"PRIx64""
++kicsef_sbm_freed(int sbid) "sbid = %d"
++
++# kic_sef traces for error conditions
++kicsef_map_multi_prp_err_invalid_prp(void) "invalid prp"
++kicsef_map_multi_prp_err_prp_bad(uint64_t prp_ent) "bad prp = 0x%"PRIx64""
++kicsef_read_err_map_fail(uint64_t prp1, uint64_t prp2, uint32_t nlb, uint64_t data_size) "prp1 = 0x%"PRIx64", prp2 = 0x%"PRIx64", nlb = 0x%"PRIx32", data_size = 0x%"PRIx64""
++# old nvme error code not in 6.0
++pci_nvme_err_invalid_prp(void) "invalid PRP"
++pci_nvme_err_invalid_ns(uint32_t ns, uint32_t limit) "invalid namespace %u not within 1-%u"
++pci_nvme_err_invalid_prp2_missing(void) "PRP2 is null and more data to be transferred"
+diff --git a/include/block/nvme.h b/include/block/nvme.h
+index bb231d0b9a..47c88fe949 100644
+--- a/include/block/nvme.h
++++ b/include/block/nvme.h
+@@ -612,12 +612,14 @@ enum NvmeAdminCommands {
+     NVME_ADM_CMD_SET_FEATURES   = 0x09,
+     NVME_ADM_CMD_GET_FEATURES   = 0x0a,
+     NVME_ADM_CMD_ASYNC_EV_REQ   = 0x0c,
++    NVME_ADM_CMD_NS_MGMT        = 0x0d,
+     NVME_ADM_CMD_ACTIVATE_FW    = 0x10,
+     NVME_ADM_CMD_DOWNLOAD_FW    = 0x11,
+     NVME_ADM_CMD_NS_ATTACHMENT  = 0x15,
+     NVME_ADM_CMD_DIRECTIVE_SEND = 0x19,
+     NVME_ADM_CMD_VIRT_MNGMT     = 0x1c,
+     NVME_ADM_CMD_DIRECTIVE_RECV = 0x1a,
++    NVME_ADM_CMD_CAP_MGMT       = 0x20,
+     NVME_ADM_CMD_DBBUF_CONFIG   = 0x7c,
+     NVME_ADM_CMD_FORMAT_NVM     = 0x80,
+     NVME_ADM_CMD_SECURITY_SEND  = 0x81,
+@@ -736,6 +738,34 @@ typedef struct QEMU_PACKED NvmeRwCmd {
+     uint16_t    appmask;
+ } NvmeRwCmd;
+ 
++typedef struct QEMU_PACKED NvmePhysRead {
++    uint8_t     opcode;
++    uint8_t     flags;
++    uint16_t    cid;
++    uint32_t    nsid;
++    uint64_t    rsvd2;
++    uint64_t    mptr;
++    NvmeCmdDptr dptr;
++    uint64_t    sua;
++    struct {
++        uint16_t    lr:1;
++        uint16_t    res30:1;
++        uint16_t    prinfo:4;
++        uint16_t    res25:1;
++        uint16_t    stc:1;
++        uint16_t    res16:8;
++    };
++    uint16_t    nadu;
++    uint32_t    rfid;
++    struct {
++        uint64_t    owt:16;
++        uint64_t    sfla:48;
++    };
++} NvmePhysRead;
++
++_Static_assert(sizeof(NvmePhysRead) == sizeof(NvmeCmd),"Command size mismatch");
++
++
+ enum {
+     NVME_RW_LR                  = 1 << 15,
+     NVME_RW_FUA                 = 1 << 14,
+@@ -1028,7 +1058,9 @@ enum {
+     NVME_CMD_EFF_NCC        = 1 << 2,
+     NVME_CMD_EFF_NIC        = 1 << 3,
+     NVME_CMD_EFF_CCC        = 1 << 4,
+-    NVME_CMD_EFF_CSE_MASK   = 3 << 16,
++    NVME_CMD_EFF_CSE_NCN    = 1 << 16,
++    NVME_CMD_EFF_CSE_NCA    = 2 << 16,
++    NVME_CMD_EFF_CSE_MASK   = 3 << 16,  // should really b 7
+     NVME_CMD_EFF_UUID_SEL   = 1 << 19,
+ };
+ 
+@@ -1171,6 +1203,7 @@ enum NvmeIdCtrlOaes {
+ 
+ enum NvmeIdCtrlCtratt {
+     NVME_CTRATT_ENDGRPS = 1 <<  4,
++    NVME_CTRATT_DELENDG = 1 << 13,
+     NVME_CTRATT_ELBAS   = 1 << 15,
+     NVME_CTRATT_FDPS    = 1 << 19,
+ };
+@@ -1380,6 +1413,7 @@ typedef struct QEMU_PACKED NvmeIdNs {
+     uint16_t    mssrl;
+     uint32_t    mcl;
+     uint8_t     msrc;
++    //uint32_t    anagrpid;
+     uint8_t     rsvd81[18];
+     uint8_t     nsattr;
+     uint16_t    nvmsetid;
+diff --git a/kic_sef.md b/kic_sef.md
+new file mode 100644
+index 0000000000..bd54372cdc
+--- /dev/null
++++ b/kic_sef.md
+@@ -0,0 +1,156 @@
++# Change Log
++## v0.57.5 November 21st 2023
++- Purpose
++    - Issues
++    - LD2 compatibility
++    - ZNS
++- Changes
++    - Added paging support to super block list log page
++    - Fixed super block list buffer overrun #150
++    - Added pSLC support to zns #147
++    - Fixed properly setting active zones base on number of open super blocks
++    - Fixed auto-config for sim based nvme emulation
++    - Added auto config for all SEF backed devices
++    - Added sbid_rr switch to control sbid allocation (mru vs lru)
++    - Return 0x81 status for first adu defect when emulating the LD2
++    - Added --enable-sef-emu to explicitly enable the emulator
++    - Fixed aborting NLW not honoring close_req #137
++## v0.56.5 August 28th 2023
++- Purpose
++    - LD2 compatibility
++    - SEFAPI v1.14e support
++- Changes
++    - Added pSLC support to the emulator.  Added "pslc" property that when set
++      to "no" returns id.cap with pslc support bit off. - Issue #145
++    - Updated calls to SEFAllocateSuperBlock to pass a null ptr to the new
++      defect parameter output parameter (v1.14e)
++## v0.55.5 June 8th 2023
++- Purpose
++    - Issues
++    - LD2 compatibility
++- Changes
++    - Version bumped because persistence format changed. Fixed under Issue #129
++      where vd user space overlapped.  Also added capcfg to be save, sbd space
++      enlarged to handle ndies/sb < vd.ndies, qosd space is based on the nqd
++      param.
++    - Fixed where n->nblk was being used instead of vd_desc->nblk - Issue #128
++    - Fixed setting of die/sb allowing aobw to exceed 32-bits - No issue
++    - Fixed assert with when NLC/GCR failed request - Issues #126
++    - Fixed FAR/NLW of SBID -1 allowing sbid=1 to be sbid=0 - issue #124
++    - sb_info.dgid now filled in
++    - SBBW:AOBW no longer have to sum to 24, settable via launch options sbbw
++      and aobw and now default to 24:24 instead of 16:32 to match the LD2
++      issue #127
++    - NLW & NLC now support sblid != 16 - issue #130
++    - Fixed handling of nacre being smaller than src/dest size in nlc.  Code
++      now sets NLC_CSTS_CONSUMED_ACRE for nlc and gcr in this case and doesn't
++      trigger the sanitizer.
++    - Fixed SEGV in kicsef_sbm indexing with 0xffff plid - issue #141
++    - Fixed large NLC hitting closed SB when close issued before NLC is done.
++      issue #142
++
++## v0.54.5 not released
++- Purpose
++    - Testing
++    - Issues
++    - LD2 compatibility
++- Changes
++    - 2 Program faults per SB now supported.  Required by WR29 to pass.
++      Did not bump the IF # since it's just a test that doesn't pass.
++    - LD2 support updated to only issue partial writes when write by sbid and
++      always close the current block and send an AEN.
++    - Fix for ACO not closing super blocks when more than 1 acoes.  This was
++      causing WR16 to sometimes fail with a double close and would always
++      log an error that sb_info not found.
++    - Fixed leak after itest has run - issue #121
++
++## v0.53.5 February 3rd 2023
++- Purpose
++    - Gitlab issues
++    - LD2 compatibility
++- Changes
++    - Support for 16-bit placement id's to a max of 64k-1.
++    - NSID is now read-only and selected by the device like LD2
++    - NLWs moved to co-routines to match NLCs.  Flush now queued
++      and close is pseudo queued to be processed after queued NLWs.
++    - Swapped position of NADU and ACOID in NLW completion to match
++      spec/LD2 - issue #110
++    - Updated ACO to be v1.12 CS and match LD2 - issue #111
++    - SetF QoS, fixed ewt/wwt pos in CDW12 when setting weights
++    - SetF QoS, fixed pos of rfid in CDW12 when setting default fifo
++
++## v0.52.4 July 29th 2022
++- Purpose
++    - Gitlab issues
++    - LD2 compatibility
++- Changes
++    - ADUs left in ARR now reflect space used by FUA.  Interface version bumped
++      to 4 because w/o this, libsef 0.40 won't work correctly.
++    - Fixed SEF_VWB_SIZE to be in ADUs instead of bytes.  This was preventing
++      NLC data from flushing requiring EOP to trigger greatly slowing down
++      the SDKs GC to the point SDK CI/CD would timeout.
++    - Requires libsef v0.40
++
++## v0.51.3 June 3rd 2022
++- Purpose
++    - Gitlab issues
++    - LD2 compatibility
++- Changes
++    - Read fifo log page doesn't support vdid of 0xffff - issue #97
++    - Move CC bit for SBM from CQE.DW0 to CQE.DW1. KICSEF_CS_VER changed from
++      v1.11 to v1.13 - issue #99
++    - Requires libsef v0.38
++
++## v0.50.2 May 27th 2022
++- Purpose
++    - Compatibility with LD2
++    - gitlab issues
++- Changes
++    - Added support for nvme_identify_ns_descs(). NVMe ver is now 1.3.  Issue #89
++    - Added support for cmd and feature support-and-effects log
++    - SBM CLOSE wasn't setting the CC bit. Found working on issue lib-driver#135
++    - Retain Open reason in sbinfo.sbs when closed - issue #91
++    - Support ident CNS 07h, 08h, 10h-13h, 1Ah-1Ch ident support - issue #92
++
++## v0.49.1 May 13th 2022
++- Purpose
++    - Compatibility with LD2
++- Changes
++    - Removed remaining support for ENGID config 3
++    - Create a default read fifo per VD using VDID as RFID.  Issue #87
++## v0.48.0 May 6th 2022
++- Purpose
++    - Compatibility with LD2
++- Changes
++    - Creates QoSD detached
++    - Supports ns attach/detach
++    - Supports ident Endurance Group List (cns=0x19)
++    - Defines a controller subsystem nqn to distinguish the emulator from LD2
++      and libsef can verify its compatibility.
++    - Fixed issue #83 - SBM commands now return SB log page
++    - Fixed issue #85 - NLW queued first caused FAR to double complete
++## v0.47 April 29th 2022
++- Purpose
++    - Fixing issue with LD2
++-Changes
++    - NLW/FAR has better error checking to match the spec.  Far's error checking
++      moved to after NLW is received.
++## v0.46 April 22nd 2022
++- Purpose
++    - Fixing issue with LD2
++- Changes
++    - Fixed units of vd/dev capacity to be num planes.  It was in num VWBs
++      Requires libsef v0.32+ (lib-driver v0.33).
++## v0.45 April 15th 2022
++- Purpose
++    - Fixing git lab issues
++- Changes
++    - Fixed issue #75 - UA of 0xff are incremented when written
++    - Fixed issue discoverd while brining up LD2 - Setting the capacity
++      configuration wasn't to spec.
++## v0.44
++- Purpose
++    - Fixing git lab issues
++- Changes
++    - Fixed issue #80 - crash in kicsef_read_fifo_list_log when creating a single vd of id 15.
++    - Fixed issue #79 - SB log info fails for max vdid (16)
+\ No newline at end of file
+diff --git a/meson.build b/meson.build
+index c44d05a13f..ba79d51639 100644
+--- a/meson.build
++++ b/meson.build
+@@ -544,6 +544,11 @@ if gdbus_codegen.found() and get_option('cfi')
+   gdbus_codegen = not_found
+   gdbus_codegen_error = '@0@ uses gdbus-codegen, which does not support control flow integrity'
+ endif
++sef = not_found
++if 'CONFIG_SEF' in config_host
++  sef = declare_dependency(compile_args: config_host['SEF_CFLAGS'].split(),
++                              link_args: config_host['SEF_LIBS'].split())
++endif
+ 
+ lttng = not_found
+ if 'ust' in get_option('trace_backends')
+@@ -3788,6 +3793,8 @@ summary_info += {'vhost-user-crypto support': have_vhost_user_crypto}
+ summary_info += {'vhost-user-blk server support': have_vhost_user_blk_server}
+ summary_info += {'vhost-vdpa support': have_vhost_vdpa}
+ summary_info += {'build guest agent': have_ga}
++summary_info += {'sef support': config_host.has_key('CONFIG_SEF')}
++summary_info += {'sef-emu support': config_host.has_key('CONFIG_SEF_EMU')}
+ summary(summary_info, bool_yn: true, section: 'Configurable features')
+ 
+ # Compilation information
+diff --git a/softmmu/vl.c b/softmmu/vl.c
+index ea20b23e4c..321a75ab16 100644
+--- a/softmmu/vl.c
++++ b/softmmu/vl.c
+@@ -2631,6 +2631,25 @@ void qmp_x_exit_preconfig(Error **errp)
+     }
+ }
+ 
++/*
++#ifdef CONFIG_MODULES
++void qemu_load_module_for_opts(const char *group)
++{
++    static bool spice_tried;
++    if (g_str_equal(group, "spice") && !spice_tried) {
++        ui_module_load_one("spice-core");
++        spice_tried = true;
++    }
++
++    static bool iscsi_tried;
++    if (g_str_equal(group, "iscsi") && !iscsi_tried) {
++        block_module_load_one("iscsi");
++        iscsi_tried = true;
++    }
++}
++#endif
++*/
++
+ void qemu_init(int argc, char **argv)
+ {
+     QemuOpts *opts;
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index 5182ed0c91..f4c038f11a 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -340,6 +340,7 @@ static void arm_cpu_reset_hold(Object *obj)
+         env->uncached_cpsr = ARM_CPU_MODE_SVC;
+     }
+     env->daif = PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F;
++#endif
+ 
+     /* AArch32 has a hard highvec setting of 0xFFFF0000.  If we are currently
+      * executing as AArch32 then check if highvecs are enabled and
+diff --git a/util/qemu-config.c b/util/qemu-config.c
+index 42076efe1e..3b4dd9b542 100644
+--- a/util/qemu-config.c
++++ b/util/qemu-config.c
+@@ -359,6 +359,10 @@ static int qemu_config_foreach(FILE *fp, QEMUConfigCB *cb, void *opaque,
+         cb(group, qdict, opaque, errp);
+     }
+ out:
++    if (qdict) {
++        cb(group, qdict, opaque, errp);
++        qobject_unref(qdict);
++    }
+     loc_pop(&loc);
+ out_no_loc:
+     qobject_unref(qdict);

@@ -1,0 +1,15 @@
+#!/bin/bash
+#Interim configure script that applies the patch,
+# runs the real configure script,
+
+fullpath=$(realpath $0)
+dirpath=$(dirname $fullpath)
+pushd $dirpath
+git submodule update --init --recursive
+pushd official-qemu
+patch -N -p1 < ../SEF-QEMU.patch
+popd #official-qemu
+popd #dirpath
+
+$dirpath/official-qemu/configure "$@"
+

@@ -1,0 +1,23 @@
+[submodule "api"]
+	path = api
+	url = https://github.com/SoftwareEnabledFlash/SEF-API.git
+[submodule "fio/official-fio"]
+	path = fio/official-fio
+	url = https://github.com/axboe/fio.git
+	shallow = true
+[submodule "nvme-cli/official-nvme"]
+	path = nvme-cli/official-nvme
+	url = https://github.com/linux-nvme/nvme-cli.git
+	shallow = true
+[submodule "qemu/official-qemu"]
+	path = qemu/official-qemu
+	url = https://github.com/qemu/qemu.git
+	shallow = true
+[submodule "lib/src/liburing"]
+	path = lib/src/liburing
+	url = https://github.com/axboe/liburing.git
+	shallow = true
+[submodule "linux/official-linux"]
+	path = linux/official-linux
+	url = https://github.com/torvalds/linux.git
+	shallow = true

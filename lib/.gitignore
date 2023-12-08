@@ -1,0 +1,7 @@
+/.vscode/
+/bin/
+/BUILD/
+/LOG/
+*.bak
+*.orig
+*.org
